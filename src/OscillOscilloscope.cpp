@@ -40,16 +40,16 @@ static const uint8_t O1_GROUND		= 0x01;
 static const uint8_t O1_AC			= 0x02;
 static const uint8_t O1_COUPLING	= O1_GROUND | O1_AC;
 
-//Input filters, tested with a spiky 50 Hz signal: bit 3 stretched ~1-sample spikes to ~26 samples at 200 kS/s and
-//cut their height (the ~3 kHz low-pass, "FilterInputL"); bit 2 had no visible effect at <= 200 kS/s, consistent with
-//the ~3 MHz low-pass ("FilterInputH") but not positively confirmed.
-static const uint8_t O1_FILTER_3MHZ	= 0x04;
-static const uint8_t O1_FILTER_3KHZ	= 0x08;
-static const uint8_t O1_FILTERS		= O1_FILTER_3MHZ | O1_FILTER_3KHZ;
+//Input filters: the vendor app's "Filt L" / "Filt H" buttons = low-pass / high-pass.
+//Bit 3 is a HIGH-pass (~3 kHz): a 500 mV 50 Hz signal dropped to ~5 mV (first-order 3 kHz: 1.7 %), while fast spike
+//edges passed and decayed into tails. Bit 2 is presumably the ~3 MHz LOW-pass: no visible effect at <= 200 kS/s.
+static const uint8_t O1_LOWPASS_3MHZ	= 0x04;		//"Filt L"
+static const uint8_t O1_HIGHPASS_3KHZ	= 0x08;		//"Filt H"
+static const uint8_t O1_FILTERS			= O1_LOWPASS_3MHZ | O1_HIGHPASS_3KHZ;
 
-//ADC mode list shown by ngscopeclient (the bandwidth-limit API takes whole MHz, so it can't express 3 kHz)
-enum FilterMode { FILTER_NONE = 0, FILTER_3MHZ = 1, FILTER_3KHZ = 2 };
-static const uint8_t g_filterBits[] = { 0, O1_FILTER_3MHZ, O1_FILTER_3KHZ };
+//Shown by ngscopeclient as ADC modes. Only the low-pass maps to the bandwidth-limit API.
+enum FilterMode { FILTER_NONE = 0, FILTER_LOWPASS = 1, FILTER_HIGHPASS = 2, FILTER_BANDPASS = 3 };
+static const uint8_t g_filterBits[] = { 0, O1_LOWPASS_3MHZ, O1_HIGHPASS_3KHZ, O1_LOWPASS_3MHZ | O1_HIGHPASS_3KHZ };
 
 //T1 = trigger configuration (oscill.exe 0x4b7770)
 static const uint8_t T1_HYST_MASK	= 0x0f;		//bits 0-1 fall hysteresis, bits 2-3 rise hysteresis
@@ -67,9 +67,10 @@ static const double SW_TRIGGER_HYST_CODES = 3;	//noise is about +-2..3 codes		//
 
 //Vertical scale. V1 = volts/div in millivolts (oscill.exe: V1 = range * 1000 / 8, 8 divisions full screen).
 //The 1-2-5 steps match the vendor UI; the exact span the hardware accepts is not known.
-static const double g_voltsPerDiv[] = { 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0 };
+//Same steps as the vendor app (20 mV/div .. 10 V/div)
+static const double g_voltsPerDiv[] = { 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0 };
 static const size_t g_numVoltRanges = sizeof(g_voltsPerDiv) / sizeof(g_voltsPerDiv[0]);
-static const size_t g_defaultVoltRange = 6;		//1 V/div
+static const size_t g_defaultVoltRange = 5;		//1 V/div
 
 //The 8-bit ADC spans the 8 screen divisions, with code 128 at 0 V. Confirmed with a 1.361 V battery: 0.5 V/div gave
 //215.0 / 128.2 / 42.2 (+, shorted, reversed), 1 V/div gave 85.0 and 5 V/div 119.4 (reversed); within 1% everywhere.
@@ -797,19 +798,20 @@ vector<unsigned int> OscillOscilloscope::GetChannelBandwidthLimiters(size_t /*i*
 	return { 0, 3 };
 }
 
-/**
-	@brief 3 when either input filter is on. With the 3 kHz filter that is "at most 3 MHz", the closest the
-	whole-MHz API can get; the ADC mode list shows the exact filter.
- */
 unsigned int OscillOscilloscope::GetChannelBandwidthLimit(size_t /*i*/)
 {
-	return (m_o1 & O1_FILTERS) ? 3 : 0;
+	return (m_o1 & O1_LOWPASS_3MHZ) ? 3 : 0;
 }
 
+//Toggles only the low-pass; the high-pass (ADC mode) is left as it is
 void OscillOscilloscope::SetChannelBandwidthLimit(size_t /*i*/, unsigned int limit_mhz)
 {
 	lock_guard<recursive_mutex> lock(m_mutex);
-	PushFilter((limit_mhz == 0) ? FILTER_NONE : (limit_mhz >= 3 ? FILTER_3MHZ : FILTER_3KHZ));
+	bool hp = (m_o1 & O1_HIGHPASS_3KHZ) != 0;
+	if(limit_mhz == 0)
+		PushFilter(hp ? FILTER_HIGHPASS : FILTER_NONE);
+	else
+		PushFilter(hp ? FILTER_BANDPASS : FILTER_LOWPASS);
 }
 
 bool OscillOscilloscope::IsADCModeConfigurable()
@@ -824,22 +826,26 @@ bool OscillOscilloscope::IsADCModePerChannel()
 
 vector<string> OscillOscilloscope::GetADCModeNames(size_t /*channel*/)
 {
-	return { "Full bandwidth", "3 MHz low-pass", "3 kHz low-pass" };
+	return { "Full bandwidth", "Low-pass ~3 MHz (Filt L)", "High-pass ~3 kHz (Filt H)", "Band-pass (Filt L + Filt H)" };
 }
 
 size_t OscillOscilloscope::GetADCMode(size_t /*channel*/)
 {
-	if(m_o1 & O1_FILTER_3KHZ)
-		return FILTER_3KHZ;
-	if(m_o1 & O1_FILTER_3MHZ)
-		return FILTER_3MHZ;
+	bool lp = (m_o1 & O1_LOWPASS_3MHZ) != 0;
+	bool hp = (m_o1 & O1_HIGHPASS_3KHZ) != 0;
+	if(lp && hp)
+		return FILTER_BANDPASS;
+	if(hp)
+		return FILTER_HIGHPASS;
+	if(lp)
+		return FILTER_LOWPASS;
 	return FILTER_NONE;
 }
 
 void OscillOscilloscope::SetADCMode(size_t /*channel*/, size_t mode)
 {
 	lock_guard<recursive_mutex> lock(m_mutex);
-	if(mode <= FILTER_3KHZ)
+	if(mode <= FILTER_BANDPASS)
 		PushFilter(mode);
 }
 

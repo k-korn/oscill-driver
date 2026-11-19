@@ -66,10 +66,13 @@ vendor's `oscill.exe` / `oscilink.dll`, with function addresses), `README.md` (b
   unreachable level still returns in 0.05 s → the hardware trigger has no effect; keep the software trigger.
 - **O1 coupling confirmed** (1.36 V battery, 0.5 V/div): O1=0 → 214 (DC), O1=2 → 128 (DC blocked, AC signals pass:
   bit 1 = AC coupling), O1=1/3 → noiseless 128 (bit 0 = ground). Earlier driver had bit 1 backwards (sent AC for DC).
-  **Filters** (spiky 50 Hz signal): bit 3 = ~3 kHz low-pass (at 200 kS/s 1-sample spikes became ~18-26 samples wide
-  and lower); bit 2 = presumably ~3 MHz low-pass (no visible effect at <= 200 kS/s, not positively confirmed).
-  Exposed as ADC modes "Full bandwidth" / "3 MHz low-pass" / "3 kHz low-pass", plus bandwidth limit {0, 3} MHz
-  (reads 3 for either filter, the API can't express 3 kHz). Check: `build/smoke_test /dev/ttyUSB1:921600 3 filters`.
+  **Filters** = the vendor app's "Filt L" / "Filt H" buttons (screenshot of the Windows UI: CH1 panel has Peak, DC, Avg,
+  Gnd, HiRes, Filt H, Memo, Filt L; mV/div 20 mV..10 V; trigger Auto, slope, speed "Fastest"; MODE F/A/N/W + Delay).
+  Bit 3 = "Filt H" = HIGH-pass ~3 kHz: a 500 mV 50 Hz signal dropped to ~5 mV in ngscopeclient (first-order 3 kHz
+  predicts 1.7 %); sharp spike edges pass and become decaying tails. Bit 2 = "Filt L" = LOW-pass ~3 MHz (presumed:
+  no visible effect at <= 200 kS/s). An earlier driver labelled bit 3 a 3 kHz low-pass — wrong.
+  Exposed as ADC modes Full / Low-pass / High-pass / Band-pass; bandwidth limit {0, 3} MHz toggles only the low-pass.
+  Check: `build/smoke_test /dev/ttyUSB1:921600 3 filters`.
 - Testing gotcha: the default smoke_test's Normal/Single steps need a signal crossing 0 V on the tip (software
   trigger waits for an edge); with a flat input only Auto/Force produce waveforms.
 - Testing gotcha: smoke_test loads plugins from build/ AND ~/.scopehal/plugins; the one loaded last wins, so run
