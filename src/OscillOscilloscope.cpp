@@ -34,9 +34,11 @@ enum RunMode : uint8_t
 
 //O1 = input option bits (oscill.exe 0x4b4f50). M1 is the acquisition mode (sample/avg/hires/peak), not coupling,
 //so the driver leaves M1 alone.
-static const uint8_t O1_GROUND		= 0x01;		//confirmed: Ground1 checkbox
-static const uint8_t O1_DC_OPEN		= 0x02;		//inverted checkbox, most likely "closed input" = AC  (GUESS: set = DC)
-static const uint8_t O1_COUPLING	= O1_GROUND | O1_DC_OPEN;	//bits 2-3 are the two input filters, preserved as read
+//Confirmed with a 1.36 V battery at 0.5 V/div: O1=0 reads 214 (DC), O1=2 reads 128 (DC blocked, AC signals still pass:
+//AC coupling), O1=1 and 3 read a noiseless 128 (input grounded).
+static const uint8_t O1_GROUND		= 0x01;
+static const uint8_t O1_AC			= 0x02;
+static const uint8_t O1_COUPLING	= O1_GROUND | O1_AC;	//bits 2-3 are the two input filters, preserved as read
 
 //T1 = trigger configuration (oscill.exe 0x4b7770)
 static const uint8_t T1_HYST_MASK	= 0x0f;		//bits 0-1 fall hysteresis, bits 2-3 rise hysteresis
@@ -583,9 +585,9 @@ void OscillOscilloscope::PushCoupling()
 {
 	uint8_t o1 = m_o1 & ~O1_COUPLING;
 	if(m_coupling == OscilloscopeChannel::COUPLE_GND)
-		o1 |= O1_GROUND | O1_DC_OPEN;
-	else if(m_coupling == OscilloscopeChannel::COUPLE_DC_1M)
-		o1 |= O1_DC_OPEN;
+		o1 |= O1_GROUND;
+	else if(m_coupling == OscilloscopeChannel::COUPLE_AC_1M)
+		o1 |= O1_AC;
 	if(WriteReg1("O1", o1))
 		m_o1 = o1;
 }

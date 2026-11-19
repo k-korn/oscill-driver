@@ -64,6 +64,11 @@ vendor's `oscill.exe` / `oscilink.dll`, with function addresses), `README.md` (b
   Hardware trigger re-tested at 921600 with a clean spiky 50 Hz signal (spikes every 127 samples): in RT 1/2/3 the
   spikes drift ~26 samples per capture exactly as in free run, independent of TC (50/200), S1 level/edge, and an
   unreachable level still returns in 0.05 s → the hardware trigger has no effect; keep the software trigger.
+- **O1 coupling confirmed** (1.36 V battery, 0.5 V/div): O1=0 → 214 (DC), O1=2 → 128 (DC blocked, AC signals pass:
+  bit 1 = AC coupling), O1=1/3 → noiseless 128 (bit 0 = ground). Earlier driver had bit 1 backwards (sent AC for DC).
+  Bits 2-3 (input filters) still untested.
+- Testing gotcha: the default smoke_test's Normal/Single steps need a signal crossing 0 V on the tip (software
+  trigger waits for an edge); with a flat input only Auto/Force produce waveforms.
 - Testing gotcha: smoke_test loads plugins from build/ AND ~/.scopehal/plugins; the one loaded last wins, so run
   `cmake --install build` after every rebuild or you test a stale plugin.
 - MC drifts by itself (1991 at power-up, 1982 after writing 1991, later 1993): read it, don't assume it.
