@@ -41,6 +41,7 @@ public:
 	virtual std::vector<OscilloscopeChannel::CouplingType> GetAvailableCouplings(size_t i) override;
 	virtual double GetChannelAttenuation(size_t i) override;
 	virtual void SetChannelAttenuation(size_t i, double atten) override;
+	virtual std::vector<unsigned int> GetChannelBandwidthLimiters(size_t i) override;
 	virtual unsigned int GetChannelBandwidthLimit(size_t i) override;
 	virtual void SetChannelBandwidthLimit(size_t i, unsigned int limit_mhz) override;
 	virtual float GetChannelVoltageRange(size_t i, size_t stream) override;
@@ -79,6 +80,13 @@ public:
 	virtual bool IsInterleaving() override;
 	virtual bool SetInterleaving(bool combine) override;
 
+	//Input filters (O1 bits 2-3), shown as ADC modes
+	virtual bool IsADCModeConfigurable() override;
+	virtual bool IsADCModePerChannel() override;
+	virtual std::vector<std::string> GetADCModeNames(size_t channel) override;
+	virtual size_t GetADCMode(size_t channel) override;
+	virtual void SetADCMode(size_t channel, size_t mode) override;
+
 protected:
 	//Low level protocol
 	bool Connect();
@@ -97,6 +105,7 @@ protected:
 	//Pushing cached configuration to hardware
 	void PushAll();
 	void PushCoupling();
+	void PushFilter(size_t mode);
 	void PushVerticalRange();
 	void PushTimebase();
 	void PushTriggerLevel();

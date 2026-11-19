@@ -6,6 +6,7 @@
 #include "scopehal.h"
 #include "EdgeTrigger.h"
 
+#include <cmath>
 #include <thread>
 #include <unistd.h>
 
@@ -128,6 +129,56 @@ int main(int argc, char** argv)
 		scope->GetVendor().c_str(), scope->GetName().c_str(), scope->GetSerial().c_str(), scope->IDPing().c_str());
 
 	bool ok = true;
+
+	if( (argc > 3) && (string(argv[3]) == "filters") )
+	{
+		//Needs a spiky signal on the tip. Spikes should get lower and much wider with the 3 kHz filter.
+		LogNotice("--- input filters via ADC mode (spiky signal on the tip) ---\n");
+		scope->SetChannelCoupling(0, OscilloscopeChannel::COUPLE_DC_1M);
+		scope->SetChannelVoltageRange(0, 0, 1.6);	//0.2 V/div
+		scope->SetSampleRate(200000);
+		auto names = scope->GetADCModeNames(0);
+		for(size_t mode = 0; mode < names.size(); mode++)
+		{
+			scope->SetADCMode(0, mode);
+			scope->StartAutoTrigger();
+			double sumPeak = 0, sumWidth = 0;
+			int spikes = 0, records = 0;
+			double deadline = GetTime() + 20;
+			while(spikes < 5 && GetTime() < deadline)
+			{
+				if(scope->PollTrigger() != Oscilloscope::TRIGGER_MODE_TRIGGERED || !scope->AcquireData())
+					continue;
+				scope->PopPendingWaveform();
+				records++;
+				auto w = dynamic_cast<UniformAnalogWaveform*>(scope->GetOscilloscopeChannel(0)->GetData(0));
+				w->PrepareForCpuAccess();
+				size_t ipk = 0;
+				for(size_t k=0; k<w->size(); k++)
+					if(fabs(w->m_samples[k]) > fabs(w->m_samples[ipk]))
+						ipk = k;
+				float pk = w->m_samples[ipk];
+				if(fabs(pk) < 0.075)
+					continue;		//no spike in this record
+				size_t a = ipk, b = ipk;
+				while(a > 0 && w->m_samples[a-1] * pk > 0 && fabs(w->m_samples[a-1]) >= fabs(pk) / 2) a--;
+				while(b + 1 < w->size() && w->m_samples[b+1] * pk > 0 && fabs(w->m_samples[b+1]) >= fabs(pk) / 2) b++;
+				sumPeak += fabs(pk);
+				sumWidth += b - a + 1;
+				spikes++;
+			}
+			scope->Stop();
+			LogNotice("  ADC mode %zu \"%s\" (BW limit reads %u MHz): %d spikes in %d records, |peak| %.0f mV, width %.1f samples\n",
+				mode, names[mode].c_str(), scope->GetChannelBandwidthLimit(0), spikes, records,
+				spikes ? sumPeak / spikes * 1e3 : 0, spikes ? sumWidth / spikes : 0);
+		}
+		scope->SetADCMode(0, 0);
+		scope = nullptr;
+		ScopehalStaticCleanup();
+		fflush(stdout);
+		fflush(stderr);
+		_exit(0);
+	}
 
 	if( (argc > 3) && (string(argv[3]) == "trigger") )
 	{
