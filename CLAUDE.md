@@ -32,15 +32,20 @@ vendor's `oscill.exe` / `oscilink.dll`, with function addresses), `README.md` (b
 - Register writes work; the reply echoes name + value (`a0 00 0a 71 00 05 'O1' b1 01`), not a bare `a0 00 03`.
 - GET 'D' reply: `a0 01 0c | 72 00 04 44 | 49 01 05 | 00 00 04 00 | 254 samples`. The "7 metadata bytes" of
   the spec are the 3-byte End-of-Body header + 4 bytes (`00 00 04 00` so far). Sample count = QS (254).
-- **Problem:** in free-run mode the samples are all 255 except the first two (≈240, ≈67) and do not change with
-  O1 = 0/1/2/3 (ground made no difference). The ADC data isn't tracking the input — likely a start/arm step the
-  vendor app performs is missing. Unresolved.
+- **GET 'C' once after connecting is required**: before it, 'D' returned a stale all-255 buffer that ignored every
+  setting; after it the samples follow the input (floating tip at 0.1 V/div: noise 119..143 around 128).
+  The first two samples of a record are junk (≈243-255, ≈66).
+- In Auto mode with no trigger, 'D' answers at once with an empty body `a0 00 0a 72 00 04 44 49 00 03`.
+- **TS confirmed**: sample period = TS/256 × MC × 10 ps. TS 2030000, MC 1982 → 157.2 µs/sample; 50 Hz mains hum
+  showed a 126-sample period (50.5 Hz). TMl/TMh (25/256) are NOT TS limits (meaning unknown).
+- MC drifts by itself (1991 at power-up, 1982 after writing 1991, later 1993): read it, don't assume it.
 
 ## Open questions / next tests (in this order)
-1. ~~Register writes~~ — work. 2. ~~Reading settings registers~~ — PUT + name-only 'q'. 3. ~~Waveform layout~~ — known.
-3b. Why the samples don't follow the input (see Problem above). Ideas: other 'r' commands the vendor app sends
-   before 'D'; the ADC needs RT/MC/TS rewritten after power-up; physical setup (battery, tip connection).
-4. Timebase (note: TS = 512 at power-up, i.e. above TMh = 256): TMl/TMh = 25..256 contradicts "TS = clocks per sample × 256" for slow rates. Measure: write a few TS values, capture 50 Hz mains hum (touch the tip), count samples per period. Then fix `RateToTS`/`GetSampleRatesNonInterleaved` in the driver — **do not trust the current sample-rate list until this is done**.
+1. ~~Register writes~~, ~~settings reads~~, ~~waveform layout~~, ~~stale data~~ (GET 'C'), ~~TS formula~~ — done.
+2. Build the plugin against an ngscopeclient build (none installed on this PC yet) and try it end to end.
+3. Junk first two samples: drop them in the driver? Check what the 4 metadata bytes mean (byte 0 varies 00/10/20/30).
+4. Volt scale with a known DC source (battery), O1 bits (ground made no visible change at 10 V/div — retest at
+   0.1 V/div with a signal), trigger S1/T1/TC with mains hum.
 5. Then the README's volt-scale, O1-bit and trigger tests.
 
 ## Building
