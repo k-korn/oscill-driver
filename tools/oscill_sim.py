@@ -66,7 +66,14 @@ class Probe:
         if self.args.silent:
             return
         if op == 0x80:
-            self.send(bytes.fromhex("A0 00 07 10 00 00 18"))
+            if self.args.boot:
+                # bootloader reply as captured from a real probe
+                self.send(bytes.fromhex("a0 00 14 10 00 04 80 05 00 0d 00 42 00 4f 00 4f 00 54 00 00"))
+            else:
+                self.send(bytes.fromhex("A0 00 07 10 00 00 18"))
+            return
+        if self.args.boot:
+            self.send(frame(0xD0))
             return
         if len(pkt) >= 7 and pkt[3] == 0x72:
             cmd = chr(pkt[6])
@@ -159,6 +166,7 @@ def main():
     ap.add_argument("--trigger-delay", type=float, default=0.2, help="seconds to hold 'D' in Normal mode")
     ap.add_argument("--link", help="also create a symlink to the pty at this path")
     ap.add_argument("--reject-writes", action="store_true", help="answer every register PUT with 0xD0 (error)")
+    ap.add_argument("--boot", action="store_true", help="behave like a probe stuck in its bootloader")
     ap.add_argument("--silent", action="store_true", help="never answer anything (dead probe)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()

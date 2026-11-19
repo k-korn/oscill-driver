@@ -46,8 +46,18 @@ def packet(op, body):
 
 
 class Link:
-    def __init__(self, port, baud, verbose):
-        self.s = serial.Serial(port, baud, timeout=0.1)
+    def __init__(self, port, baud, verbose, dtr=None, rts=None):
+        # Configure DTR/RTS *before* opening so the lines never glitch: on some adapters they are wired to the
+        # probe's reset / boot-select pins
+        self.s = serial.Serial()
+        self.s.port = port
+        self.s.baudrate = baud
+        self.s.timeout = 0.1
+        if dtr is not None:
+            self.s.dtr = dtr
+        if rts is not None:
+            self.s.rts = rts
+        self.s.open()
         self.verbose = verbose
 
     def send(self, data):
@@ -79,6 +89,9 @@ class Link:
         r = self.xfer(bytes.fromhex("80 00 07 10 00 10 00"))
         if not r or r[0] != 0xA0:
             sys.exit(f"no CONNECT response (got {hexs(r) if r else 'nothing'})")
+        if "BOOT".encode("utf-16-be") in r:
+            print("WARNING: probe reports BOOT state (bootloader, not the oscilloscope firmware). "
+                  "All other commands will fail. Unplug and replug the probe.", file=sys.stderr)
         return r
 
     def cmd(self, c, timeout=1.5):
@@ -139,6 +152,9 @@ def main():
     ap.add_argument("-p", "--port", default="/dev/ttyUSB0")
     ap.add_argument("-b", "--baud", type=int, default=9600)
     ap.add_argument("-v", "--verbose", action="store_true", help="hex dump all traffic to stderr")
+    onoff = {"on": True, "off": False}
+    ap.add_argument("--dtr", choices=onoff, help="hold DTR at this level from the moment the port opens")
+    ap.add_argument("--rts", choices=onoff, help="hold RTS at this level from the moment the port opens")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("id")
     r = sub.add_parser("read")
@@ -162,7 +178,8 @@ def main():
     raw.add_argument("bytes", nargs="+")
     args = ap.parse_args()
 
-    link = Link(args.port, args.baud, args.verbose)
+    link = Link(args.port, args.baud, args.verbose,
+                {"on": True, "off": False}.get(args.dtr), {"on": True, "off": False}.get(args.rts))
     link.connect()
 
     if args.cmd == "id":

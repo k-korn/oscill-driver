@@ -9,6 +9,7 @@
 #include "OscillOscilloscope.h"
 
 #include <cmath>
+#include <algorithm>
 #include <regex>
 #include <unistd.h>
 
@@ -212,6 +213,16 @@ bool OscillOscilloscope::Connect()
 	}
 	if(!ok)
 		return false;
+
+	//The bootloader answers CONNECT with an OBEX Description header (0x05) reading "BOOT" in UTF-16
+	static const uint8_t bootUtf16[] = { 0, 'B', 0, 'O', 0, 'O', 0, 'T' };
+	if(search(reply.begin(), reply.end(), begin(bootUtf16), end(bootUtf16)) != reply.end())
+	{
+		LogError("Oscill: probe is in BOOT (bootloader) state, not running its oscilloscope firmware. "
+			"Unplug and replug it; do not leave DTR/RTS toggling enabled on the port.\n");
+		return false;
+	}
+
 	LogDebug("Oscill: connected at %u baud (CONNECT reply: %s)\n", m_port.GetBaudRate(), HexDump(reply).c_str());
 
 	if(wantedBaud != m_port.GetBaudRate())
