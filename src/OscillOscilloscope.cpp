@@ -46,6 +46,7 @@ static const uint8_t T1_EDGE_MASK	= T1_FALLING | T1_RISING;
 
 //Timer registers (TD trigger delay, TA / TW auto / wait timeouts) count units of 12000 MCU clocks
 static const double TIMER_TICK_CLOCKS = 12000;
+static const double AUTO_TIMEOUT_S = 0.1;		//Auto mode: free-run after this long without a trigger
 
 //Vertical scale. V1 = volts/div in millivolts (oscill.exe: V1 = range * 1000 / 8, 8 divisions full screen).
 //The 1-2-5 steps match the vendor UI; the exact span the hardware accepts is not known.
@@ -551,6 +552,17 @@ void OscillOscilloscope::PushAll()
 	PushTriggerLevel();
 	PushTriggerSlope();
 	PushTriggerDelay();
+	PushAutoTimeout();
+}
+
+/**
+	@brief Auto mode fires on its own after TA. Its power-up value (65280 ticks, ~15.6 s at 50 MHz) makes Auto
+	look dead, so set a short timeout.
+ */
+void OscillOscilloscope::PushAutoTimeout()
+{
+	double tickS = TIMER_TICK_CLOCKS * m_mc * MC_UNIT_FS / FS_PER_SECOND;
+	WriteReg4("TA", (uint32_t)max(1.0, llround(AUTO_TIMEOUT_S / tickS) * 1.0));
 }
 
 void OscillOscilloscope::PushCoupling()

@@ -7,6 +7,7 @@
 #include "EdgeTrigger.h"
 
 #include <thread>
+#include <unistd.h>
 
 using namespace std;
 
@@ -111,6 +112,10 @@ int main(int argc, char** argv)
 
 	LogNotice("%s\n", ok ? "SMOKE TEST PASSED" : "SMOKE TEST FAILED");
 	ScopehalStaticCleanup();
-	g_log_sinks.clear();
-	return ok ? 0 : 1;
+
+	//With an installed libscopehal the test carries its own copy of the logging code, whose globals interpose
+	//libscopehal's; both would destroy them at exit (double free). Skip static destructors.
+	fflush(stdout);
+	fflush(stderr);
+	_exit(ok ? 0 : 1);
 }

@@ -101,6 +101,7 @@ protected:
 	void PushTriggerLevel();
 	void PushTriggerSlope();
 	void PushTriggerDelay();
+	void PushAutoTimeout();
 	bool PushRunMode(uint8_t mode);
 
 	//Scaling helpers
