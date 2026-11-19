@@ -120,6 +120,8 @@ OscillOscilloscope::OscillOscilloscope(SCPITransport* transport)
 	, m_t1(0)
 	, m_triggerOffset(0)
 	, m_swTriggerPhase(0)
+	, m_swTrigLevel(0)
+	, m_swTrigEdges(EDGE_RISING_BIT)
 	, m_lastDepth(NOMINAL_SAMPLE_COUNT)
 	, m_regWriteFailures(0)
 {
@@ -528,28 +530,51 @@ void OscillOscilloscope::CancelPendingAcquisition()
 		return;
 	m_requestOutstanding = false;
 
-	if(!SendFrame(BuildCommand(CMD_CANCEL)))
-		return;
-
-	//Expect the cancel ACK (A0 00 03). A waveform may sneak in first if the trigger fired at the same moment.
+	//The hardware trigger never holds a GET 'D' back, so its reply is already on its way. Let it finish instead of
+	//sending GET 'C' into it: sending while the probe transmits makes it restart the reply, which desynchronised
+	//the stream on real hardware (seen as "a0 00 ba 72 a0 00 ba 72 00 04 44 ..." in ngscopeclient's log).
 	Bytes f;
-	double deadline = GetTime() + 1.5;
+	double deadline = GetTime() + 2.0;
 	while(true)
 	{
 		int remaining = (int)((deadline - GetTime()) * 1e3);
 		if(remaining <= 0)
-		{
-			LogWarning("Oscill: no ACK for cancel, flushing\n");
-			m_rxBuf.clear();
-			m_port.Drain();
-			return;
-		}
+			break;
 		if(!ReadFrame(f, remaining))
 			continue;
 		if(IsCommandReply(f, CMD_DATA))
-			continue;
-		break;
+			return;			//the reply we were waiting for: discard it
+		LogWarning("Oscill: unexpected frame while finishing a waveform request: %s\n", HexDump(f, 16).c_str());
+		Resync();
+		return;
 	}
+
+	//Nothing came back: cancel explicitly and expect the ACK (A0 00 03)
+	if(!SendFrame(BuildCommand(CMD_CANCEL)))
+		return;
+	deadline = GetTime() + 1.0;
+	while(true)
+	{
+		int remaining = (int)((deadline - GetTime()) * 1e3);
+		if(remaining <= 0 || !ReadFrame(f, remaining))
+		{
+			LogWarning("Oscill: no ACK for cancel, flushing\n");
+			Resync();
+			return;
+		}
+		if(!IsCommandReply(f, CMD_DATA))
+			break;
+	}
+	m_rxBuf.clear();
+}
+
+/**
+	@brief Throws away everything buffered or still arriving, to get back to a frame boundary
+ */
+void OscillOscilloscope::Resync()
+{
+	m_rxBuf.clear();
+	m_port.Drain(30);
 	m_rxBuf.clear();
 }
 
@@ -913,6 +938,15 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 {
 	lock_guard<recursive_mutex> lock(m_mutex);
 
+	//Port gone (unplugged / USB reset): stop instead of retrying forever
+	if(m_connected && !m_port.IsOpen())
+	{
+		LogError("Oscill: lost the probe; reconnect it in ngscopeclient\n");
+		m_connected = false;
+		m_triggerArmed = false;
+		m_requestOutstanding = false;
+	}
+
 	if(!m_triggerArmed || !m_connected)
 		return TRIGGER_MODE_STOP;
 	if(m_frameReady)
@@ -961,6 +995,7 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 
 		LogWarning("Oscill: unexpected reply to GET 'D': %s\n", HexDump(f, 16).c_str());
 		m_requestOutstanding = false;
+		Resync();
 		return TRIGGER_MODE_WAIT;
 	}
 
@@ -980,21 +1015,15 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
  */
 bool OscillOscilloscope::ApplySoftwareTrigger(const WaveformFrame& wf)
 {
+	//Runs on the instrument thread: use the cached trigger settings only. ngscopeclient can replace (and delete)
+	//the trigger object from the GUI thread at any time without taking our lock.
 	m_swTriggerPhase = 0;
-	auto et = GetEdgeTrigger();
-	if(!et || wf.samples.size() <= JUNK_SAMPLES + 1)
+	if(wf.samples.size() <= JUNK_SAMPLES + 1)
 		return false;
 
-	int edges = 0;
-	switch(et->GetType())
-	{
-		case EdgeTrigger::EDGE_RISING:		edges = EDGE_RISING_BIT; break;
-		case EdgeTrigger::EDGE_FALLING:		edges = EDGE_FALLING_BIT; break;
-		default:							edges = EDGE_RISING_BIT | EDGE_FALLING_BIT; break;
-	}
-
+	int edges = m_swTrigEdges;
 	int64_t period = GetSamplePeriodFs();
-	double level = g_adcZeroCode + et->GetLevel() / GetVoltsPerCode();
+	double level = g_adcZeroCode + m_swTrigLevel / GetVoltsPerCode();
 	double target = (double)m_triggerOffset / period;
 	//No filtering: narrow (single-sample) pulses are legitimate signals and must be able to trigger
 	double pos = FindEdge(&wf.samples[JUNK_SAMPLES], wf.samples.size() - JUNK_SAMPLES,
@@ -1162,6 +1191,24 @@ void OscillOscilloscope::PullTrigger()
 		et->SetType(EdgeTrigger::EDGE_RISING);
 		m_trigger = et;
 	}
+	CacheTriggerSettings();
+}
+
+/**
+	@brief Copies level and edge from the trigger object into plain members, under m_mutex, for the instrument thread
+ */
+void OscillOscilloscope::CacheTriggerSettings()
+{
+	auto et = dynamic_cast<EdgeTrigger*>(m_trigger);
+	if(!et)
+		return;
+	m_swTrigLevel = et->GetLevel();
+	switch(et->GetType())
+	{
+		case EdgeTrigger::EDGE_RISING:		m_swTrigEdges = EDGE_RISING_BIT; break;
+		case EdgeTrigger::EDGE_FALLING:		m_swTrigEdges = EDGE_FALLING_BIT; break;
+		default:							m_swTrigEdges = EDGE_RISING_BIT | EDGE_FALLING_BIT; break;
+	}
 }
 
 void OscillOscilloscope::PushTrigger()
@@ -1172,6 +1219,7 @@ void OscillOscilloscope::PushTrigger()
 		LogWarning("Oscill: only edge triggers are supported\n");
 		return;
 	}
+	CacheTriggerSettings();
 	PushTriggerLevel();
 	PushTriggerSlope();
 }

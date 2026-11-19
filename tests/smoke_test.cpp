@@ -6,6 +6,7 @@
 #include "scopehal.h"
 #include "EdgeTrigger.h"
 
+#include <atomic>
 #include <cmath>
 #include <thread>
 #include <unistd.h>
@@ -96,13 +97,13 @@ int main(int argc, char** argv)
 
 	if(argc < 2)
 	{
-		LogError("usage: %s /dev/ttyUSB0:9600 [count] [trigger]\n", argv[0]);
+		LogError("usage: %s /dev/ttyUSB0:921600 [count] [trigger|filters|stress]\n", argv[0]);
 		return 2;
 	}
 	int count = (argc > 2) ? atoi(argv[2]) : 3;
 
 	if(!VulkanInit(true))	//headless
-		return 1;
+		_exit(1);	//not return: see the _exit() at the end
 	TransportStaticInit();
 	DriverStaticInit();
 	InitializePlugins();
@@ -112,23 +113,88 @@ int main(int argc, char** argv)
 	if(find(drivers.begin(), drivers.end(), "oscill") == drivers.end())
 	{
 		LogError("driver \"oscill\" not registered - is liboscill.so in ~/.scopehal/plugins?\n");
-		return 1;
+		_exit(1);	//not return: see the _exit() at the end
 	}
 
 	auto transport = SCPITransport::CreateTransport("uart", argv[1]);
 	if(!transport || !transport->IsConnected())
 	{
 		LogError("could not open %s\n", argv[1]);
-		return 1;
+		_exit(1);	//not return: see the _exit() at the end
 	}
 	auto scope = Oscilloscope::CreateOscilloscope("oscill", transport);
 	if(!scope)
-		return 1;
+		_exit(1);	//not return: see the _exit() at the end
 	scope->m_nickname = "oscill";
 	LogNotice("Connected: vendor \"%s\", model \"%s\", serial \"%s\", IDPing \"%s\"\n",
 		scope->GetVendor().c_str(), scope->GetName().c_str(), scope->GetSerial().c_str(), scope->IDPing().c_str());
 
 	bool ok = true;
+
+	if( (argc > 3) && (string(argv[3]) == "stress") )
+	{
+		//Mimics ngscopeclient: one thread acquires while another changes settings, replacing the trigger object
+		//(and deleting the old one) without the driver's lock, like Oscilloscope::SetTrigger() from the GUI.
+		LogNotice("--- stress: acquisition thread vs settings thread for 30 s ---\n");
+		atomic<bool> done(false);
+		atomic<int> waveforms(0), changes(0);
+		scope->StartAutoTrigger();
+		thread acq([&]()
+		{
+			while(!done)
+			{
+				if(scope->PollTrigger() == Oscilloscope::TRIGGER_MODE_TRIGGERED && scope->AcquireData())
+				{
+					scope->PopPendingWaveform();
+					waveforms++;
+				}
+			}
+		});
+		static const float ranges[] = { 0.8, 1.6, 4, 8 };
+		static const uint64_t rates[] = { 6400, 20000, 100000, 200000 };
+		double end = GetTime() + 30;
+		for(int k = 0; GetTime() < end; k++)
+		{
+			switch(k % 4)
+			{
+				case 0:
+				{
+					auto et = new EdgeTrigger(scope.get());
+					et->SetInput(0, StreamDescriptor(scope->GetOscilloscopeChannel(0), 0), true);
+					et->SetLevel(0.05 * (k % 7) - 0.15);
+					et->SetType((k & 4) ? EdgeTrigger::EDGE_FALLING : EdgeTrigger::EDGE_RISING);
+					scope->SetTrigger(et);		//deletes the previous trigger object
+					break;
+				}
+				case 1:
+				{
+					auto et = dynamic_cast<EdgeTrigger*>(scope->GetTrigger());
+					et->SetLevel(0.02 * (k % 11) - 0.1);
+					scope->PushTrigger();
+					break;
+				}
+				case 2:
+					scope->SetChannelVoltageRange(0, 0, ranges[(k / 4) % 4]);
+					break;
+				case 3:
+					scope->SetSampleRate(rates[(k / 4) % 4]);
+					break;
+			}
+			changes++;
+			this_thread::sleep_for(chrono::milliseconds(20));
+		}
+		done = true;
+		acq.join();
+		scope->Stop();
+		LogNotice("STRESS: %d waveforms, %d settings changes\n", waveforms.load(), changes.load());
+		bool ok = waveforms > 20;
+		LogNotice("%s\n", ok ? "STRESS TEST PASSED" : "STRESS TEST FAILED");
+		scope = nullptr;
+		ScopehalStaticCleanup();
+		fflush(stdout);
+		fflush(stderr);
+		_exit(ok ? 0 : 1);
+	}
 
 	if( (argc > 3) && (string(argv[3]) == "filters") )
 	{

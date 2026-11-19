@@ -144,7 +144,7 @@ bool OscillSerial::Write(const oscill::Bytes& data)
 		{
 			if(errno == EINTR || errno == EAGAIN)
 				continue;
-			LogError("Oscill: write failed (%s)\n", strerror(errno));
+			Fail("write failed", errno);
 			return false;
 		}
 		pos += n;
@@ -174,14 +174,14 @@ size_t OscillSerial::Read(uint8_t* buf, size_t len, int timeoutMs)
 		{
 			if(errno == EINTR)
 				continue;
-			LogError("Oscill: poll failed (%s)\n", strerror(errno));
+			Fail("poll failed", errno);
 			break;
 		}
 		if(r == 0)
 			break;		//timeout
 		if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
 		{
-			LogError("Oscill: serial port error / hangup\n");
+			Fail("serial port error / hangup (probe unplugged or reset?)", 0);
 			break;
 		}
 
@@ -190,7 +190,7 @@ size_t OscillSerial::Read(uint8_t* buf, size_t len, int timeoutMs)
 		{
 			if(errno == EINTR || errno == EAGAIN)
 				continue;
-			LogError("Oscill: read failed (%s)\n", strerror(errno));
+			Fail("read failed", errno);
 			break;
 		}
 		if(n == 0)
@@ -208,4 +208,21 @@ void OscillSerial::Drain(int quietMs)
 	uint8_t junk[256];
 	while(Read(junk, sizeof(junk), quietMs) > 0)
 	{}
+}
+
+/**
+	@brief Marks the port dead after an unrecoverable error (e.g. the USB device went away), logging only once.
+
+	The fd belongs to libscopehal's transport, so it is not closed here; IsOpen() just returns false from now on and
+	every later read / write fails immediately instead of spinning on errors.
+ */
+void OscillSerial::Fail(const char* what, int err)
+{
+	if(m_fd < 0)
+		return;
+	if(err)
+		LogError("Oscill: %s (%s); giving up on the serial port\n", what, strerror(err));
+	else
+		LogError("Oscill: %s; giving up on the serial port\n", what);
+	m_fd = -1;
 }

@@ -26,6 +26,10 @@ relies on are in [Protocol.md](Protocol.md); this document covers how the driver
   with timeouts and its own termios setup (raw 8N1, no flow control).
 * Right after attaching it clears **DTR and RTS** and disables **HUPCL**. Modem-line activity resets the probe into
   its bootloader.
+* **Only one program may use the port.** With the vendor app (e.g. `oscill.exe` under Wine) polling the same probe,
+  requests interleave, replies get restarted mid-frame, and the vendor DLL may even reset the USB device.
+* If the port fails (hangup, I/O error: probe unplugged or USB reset), `OscillSerial` logs once and marks the port
+  dead; the driver then reports the instrument as stopped instead of retrying. Reconnect it in ngscopeclient.
 
 ### Connect sequence (`Connect()`)
 
@@ -69,11 +73,20 @@ ngscopeclient's instrument thread calls `PollTrigger()` in a loop while armed:
 `AcquireData()` then converts the record: drops the first 2 (garbage) samples, scales codes to volts, sets the sample
 period and the trigger phase, and queues the waveform. Records are `QS` − 2 samples (252 with the power-up `QS` of 254; `QS` has also been seen at 172).
 
-Any configuration change first cancels an outstanding `D` with `C` (`CancelPendingAcquisition()`), writes the
-register, and lets the next poll re-arm. A waveform captured with old settings is discarded.
+Any configuration change first finishes an outstanding `D` (`CancelPendingAcquisition()`): since the probe never holds
+a `D` back, its reply is already on its way, so the driver reads it to the end and discards it. Only if nothing
+arrives within 2 s does it send `C`. (Sending while the probe is transmitting makes it restart the reply and
+desynchronises the stream.) Then it writes the register and lets the next poll re-arm. A waveform captured with old
+settings is discarded. Any frame that doesn't parse triggers `Resync()`: drop the buffer and flush the input.
+
+All methods that touch the port hold the oscilloscope's `m_mutex`; ngscopeclient calls them from both its GUI and its
+instrument thread.
 
 ### Software trigger (`ApplySoftwareTrigger()`, `FindEdge()`)
 
+* Level and edge are **copied from the trigger object under `m_mutex`** whenever ngscopeclient pushes or pulls the
+  trigger (`CacheTriggerSettings()`). The instrument thread never touches the trigger object: ngscopeclient's
+  `SetTrigger()` replaces and deletes it from the GUI thread without the driver's lock.
 * Level in ADC codes: `128 + level_volts / volts_per_code`.
 * Edge search on the raw codes (after the 2 garbage samples) with **3 codes of hysteresis**: a rising edge needs the
   signal at or below `level − 3` before it reaches the level (falling: mirror image). This rejects noise of about ±2–3
@@ -185,6 +198,13 @@ build/smoke_test /dev/ttyUSB1:921600 3 trigger    # software trigger alignment, 
 ```bash
 build/smoke_test /dev/ttyUSB1:921600 3 filters    # spike height/width per ADC mode, needs a spiky signal
 ```
+
+```bash
+build/smoke_test /dev/ttyUSB1:921600 3 stress     # 30 s: acquisition thread vs a GUI-like settings thread
+```
+
+The stress mode replaces and deletes trigger objects, moves the level, and changes range and sample rate every
+~20 ms while another thread acquires. A clean run shows no warnings (e.g. 1938 waveforms during 906 changes).
 
 * The default run's Normal / Single steps need a signal crossing 0 V on the tip; with a flat input only Auto and Force
   produce waveforms (correct behaviour).

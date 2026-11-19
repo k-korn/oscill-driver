@@ -43,6 +43,8 @@ public:
 	void Drain(int quietMs = 20);
 
 protected:
+	void Fail(const char* what, int err);
+
 	int m_fd;
 	unsigned int m_baud;
 };
