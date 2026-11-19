@@ -46,7 +46,11 @@ static const uint8_t T1_EDGE_MASK	= T1_FALLING | T1_RISING;
 
 //Timer registers (TD trigger delay, TA / TW auto / wait timeouts) count units of 12000 MCU clocks
 static const double TIMER_TICK_CLOCKS = 12000;
-static const double AUTO_TIMEOUT_S = 0.1;		//Auto mode: free-run after this long without a trigger
+static const double AUTO_TIMEOUT_S = 0.1;
+
+//Software trigger (the hardware trigger does not gate captures on fw 1.26; see CLAUDE.md)
+static const size_t JUNK_SAMPLES = 2;			//first samples of every record are garbage (~250, ~66)
+static const double SW_TRIGGER_HYST_CODES = 3;	//noise is about +-2..3 codes		//Auto mode: free-run after this long without a trigger
 
 //Vertical scale. V1 = volts/div in millivolts (oscill.exe: V1 = range * 1000 / 8, 8 divisions full screen).
 //The 1-2-5 steps match the vendor UI; the exact span the hardware accepts is not known.
@@ -100,6 +104,7 @@ OscillOscilloscope::OscillOscilloscope(SCPITransport* transport)
 	, m_o1(0)
 	, m_t1(0)
 	, m_triggerOffset(0)
+	, m_swTriggerPhase(0)
 	, m_lastDepth(NOMINAL_SAMPLE_COUNT)
 	, m_regWriteFailures(0)
 {
@@ -832,7 +837,8 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 	if(m_frameReady)
 		return TRIGGER_MODE_TRIGGERED;
 
-	uint8_t mode = m_forceNext ? RUN_FREE : (m_autoMode ? RUN_AUTO : RUN_NORMAL);
+	//The probe always free-runs; triggering is done in software on each record (FindEdge)
+	uint8_t mode = RUN_FREE;
 
 	//Arm: issue GET 'D'. In Normal mode the probe holds the reply until it triggers.
 	if(!m_requestOutstanding)
@@ -858,9 +864,16 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 		}
 		if(IsCommandReply(f, CMD_DATA))
 		{
+			m_requestOutstanding = false;
+
+			//Software trigger: Normal / Single only accept a record containing the selected edge; Auto shows
+			//records without one unaligned; Force accepts anything
+			bool found = ApplySoftwareTrigger(probe);
+			if(!found && !m_autoMode && !m_forceNext)
+				return TRIGGER_MODE_WAIT;
+
 			m_frame.swap(f);
 			m_frameReady = true;
-			m_requestOutstanding = false;
 			m_forceNext = false;
 			return TRIGGER_MODE_TRIGGERED;
 		}
@@ -878,6 +891,40 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 	}
 
 	return m_autoMode ? TRIGGER_MODE_AUTO : TRIGGER_MODE_WAIT;
+}
+
+/**
+	@brief Looks for the trigger edge in a record and sets m_swTriggerPhase so that the crossing lands at the
+	configured trigger offset. Returns false (and a zero phase) if the record has no matching edge.
+ */
+bool OscillOscilloscope::ApplySoftwareTrigger(const WaveformFrame& wf)
+{
+	m_swTriggerPhase = 0;
+	auto et = GetEdgeTrigger();
+	if(!et || wf.samples.size() <= JUNK_SAMPLES + 1)
+		return false;
+
+	int edges = 0;
+	switch(et->GetType())
+	{
+		case EdgeTrigger::EDGE_RISING:		edges = EDGE_RISING_BIT; break;
+		case EdgeTrigger::EDGE_FALLING:		edges = EDGE_FALLING_BIT; break;
+		default:							edges = EDGE_RISING_BIT | EDGE_FALLING_BIT; break;
+	}
+
+	int64_t period = GetSamplePeriodFs();
+	double level = g_adcZeroCode + et->GetLevel() / GetVoltsPerCode();
+	double target = (double)m_triggerOffset / period;
+	//No filtering: narrow (single-sample) pulses are legitimate signals and must be able to trigger
+	double pos = FindEdge(&wf.samples[JUNK_SAMPLES], wf.samples.size() - JUNK_SAMPLES,
+		level, edges, SW_TRIGGER_HYST_CODES, target);
+	LogTrace("Oscill: swtrig level %.1f edges %d target %.1f -> pos %.2f\n", level, edges, target, pos);
+	if(pos < 0)
+		return false;
+
+	//Sample i is drawn at i * timescale + m_triggerPhase; put the crossing at the trigger offset
+	m_swTriggerPhase = m_triggerOffset - (int64_t)llround(pos * period);
+	return true;
 }
 
 bool OscillOscilloscope::AcquireData()
@@ -912,17 +959,19 @@ bool OscillOscilloscope::AcquireData()
 	auto chan = GetOscilloscopeChannel(0);
 	auto cap = AllocateAnalogWaveform(m_nickname + "." + chan->GetHwname());
 	cap->m_timescale = GetSamplePeriodFs();
-	cap->m_triggerPhase = 0;
+	cap->m_triggerPhase = m_swTriggerPhase;
 	cap->m_startTimestamp = start;
 	cap->m_startFemtoseconds = fs;
 
-	size_t n = wf.samples.size();
+	//Drop the garbage at the start of every record
+	size_t skip = (wf.samples.size() > JUNK_SAMPLES) ? JUNK_SAMPLES : 0;
+	size_t n = wf.samples.size() - skip;
 	m_lastDepth = n;
 	double vpc = GetVoltsPerCode();
 	cap->Resize(n);
 	cap->PrepareForCpuAccess();
 	for(size_t k=0; k<n; k++)
-		cap->m_samples[k] = (float)(((int)wf.samples[k] - g_adcZeroCode) * vpc);
+		cap->m_samples[k] = (float)(((int)wf.samples[k + skip] - g_adcZeroCode) * vpc);
 	cap->MarkSamplesModifiedFromCpu();
 
 	ChannelsDownloadStatusUpdate(0, InstrumentChannel::DownloadState::DOWNLOAD_FINISHED, 1.0);

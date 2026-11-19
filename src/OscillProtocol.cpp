@@ -340,6 +340,55 @@ string RegValue::AsText() const
 	return s;
 }
 
+double FindEdge(const uint8_t* v, size_t n, double level, int edges, double hyst, double target)
+{
+	double best = -1;
+	double bestDist = 1e30;
+	bool armedRise = false;
+	bool armedFall = false;
+	for(size_t i=0; i<n; i++)
+	{
+		double x = v[i];
+		if(x <= level - hyst)
+			armedRise = true;
+		if(x >= level + hyst)
+			armedFall = true;
+
+		if(i == 0)
+			continue;
+		double prev = v[i-1];
+		double pos = -1;
+
+		if(armedRise && (edges & EDGE_RISING_BIT) && (prev < level) && (x >= level))
+		{
+			pos = (i - 1) + (level - prev) / (x - prev);
+			armedRise = false;
+		}
+		else if(armedFall && (edges & EDGE_FALLING_BIT) && (prev > level) && (x <= level))
+		{
+			pos = (i - 1) + (prev - level) / (prev - x);
+			armedFall = false;
+		}
+
+		//A crossing in the other direction disarms that direction until the signal moves away again
+		if( (prev < level) && (x >= level) )
+			armedRise = false;
+		if( (prev > level) && (x <= level) )
+			armedFall = false;
+
+		if(pos >= 0)
+		{
+			double d = (pos > target) ? (pos - target) : (target - pos);
+			if(d < bestDist)
+			{
+				bestDist = d;
+				best = pos;
+			}
+		}
+	}
+	return best;
+}
+
 string HexDump(const Bytes& b, size_t maxBytes)
 {
 	string ret;

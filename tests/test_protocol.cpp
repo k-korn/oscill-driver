@@ -175,6 +175,35 @@ int main()
 		CHECK(ParseFirmwareString(f) == "Uosc1.2534041.21");
 	}
 
+	//Software edge trigger
+	{
+		auto near = [](double a, double b) { return (a - b < 0.01) && (b - a < 0.01); };
+
+		//Ramp up through 128 between samples 2 and 3 (120 -> 136): crossing at 2.5
+		uint8_t up[] = {110, 115, 120, 136, 140, 145};
+		CHECK(near(FindEdge(up, 6, 128, EDGE_RISING_BIT, 3, 0), 2.5));
+		CHECK(FindEdge(up, 6, 128, EDGE_FALLING_BIT, 3, 0) < 0);
+		CHECK(near(FindEdge(up, 6, 128, EDGE_RISING_BIT | EDGE_FALLING_BIT, 3, 0), 2.5));
+
+		//Falling 136 -> 120 between samples 1 and 2
+		uint8_t down[] = {140, 136, 120, 110};
+		CHECK(near(FindEdge(down, 4, 128, EDGE_FALLING_BIT, 3, 0), 1.5));
+		CHECK(FindEdge(down, 4, 128, EDGE_RISING_BIT, 3, 0) < 0);
+
+		//Noise of +-2 codes around the level never arms a 3-code hysteresis
+		uint8_t noise[] = {127, 129, 126, 130, 127, 129, 128, 126, 130};
+		CHECK(FindEdge(noise, 9, 128, EDGE_RISING_BIT | EDGE_FALLING_BIT, 3, 4) < 0);
+
+		//Two rising crossings (near 1.5 and 7.5): the one closest to the target wins
+		uint8_t two[] = {110, 120, 136, 140, 136, 120, 110, 120, 136, 140};
+		CHECK(near(FindEdge(two, 10, 128, EDGE_RISING_BIT, 3, 0), 1.5));
+		CHECK(near(FindEdge(two, 10, 128, EDGE_RISING_BIT, 3, 9), 7.5));
+
+		//Flat signal far from the level: nothing
+		uint8_t flat[] = {200, 201, 199, 200};
+		CHECK(FindEdge(flat, 4, 128, EDGE_RISING_BIT | EDGE_FALLING_BIT, 3, 2) < 0);
+	}
+
 	if(g_failures)
 	{
 		printf("%d failure(s)\n", g_failures);

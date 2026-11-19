@@ -102,6 +102,7 @@ protected:
 	void PushTriggerSlope();
 	void PushTriggerDelay();
 	void PushAutoTimeout();
+	bool ApplySoftwareTrigger(const oscill::WaveformFrame& wf);
 	bool PushRunMode(uint8_t mode);
 
 	//Scaling helpers
@@ -140,6 +141,7 @@ protected:
 	uint8_t m_o1;			//input option bits
 	uint8_t m_t1;			//trigger configuration bits
 	int64_t m_triggerOffset;
+	int64_t m_swTriggerPhase;	//time shift putting the software trigger crossing at m_triggerOffset
 	uint64_t m_lastDepth;
 
 	//Diagnostics: if the probe rejects register writes we stop spamming the log

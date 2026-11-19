@@ -122,6 +122,20 @@ bool ParseRegisterReply(const Bytes& frame, const std::string& name, RegValue& o
 
 std::string HexDump(const Bytes& b, size_t maxBytes = 64);
 
+/**
+	@brief Software edge trigger (the probe's hardware trigger does not gate captures on fw 1.26).
+
+	Finds crossings of `level` (in ADC codes) with hysteresis: a rising edge needs the signal at or below
+	level - hyst before it reaches level, a falling edge the mirror image. The crossing position is interpolated
+	between the two samples around it. Of all matching crossings, the one closest to `target` (a sample index,
+	normally the configured pre-trigger position) is returned.
+
+	@param edges	bit 0 = rising, bit 1 = falling
+	@return Fractional sample index of the chosen crossing, or a negative value if there is none
+ */
+enum { EDGE_RISING_BIT = 1, EDGE_FALLING_BIT = 2 };
+double FindEdge(const uint8_t* v, size_t n, double level, int edges, double hyst, double target);
+
 }
 
 #endif

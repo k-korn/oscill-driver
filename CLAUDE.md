@@ -50,12 +50,20 @@ vendor's `oscill.exe` / `oscilink.dll`, with function addresses), `README.md` (b
   Normal, Wait (infinite), Free → mapping may be 0=Auto 1=Norm 2=Wait 3=Free (spec said 0=Free…3=Wait). Unconfirmed.
 - The vendor UI has "NO TRIGGER!" and "If no trigger occurs: clear / keep" — the probe may always return a record and
   flag trigger status somewhere (metadata?). The 'D' handler is in oscill.exe 0x4f7aa0 → 0x4ff440 / 0x55ead0.
+- **Software trigger (current driver):** the probe always free-runs (RT=0); the driver searches each record for
+  the selected edge at the trigger level (3-code hysteresis, no filtering — single-sample pulses are real signals)
+  and sets m_triggerPhase so the crossing lands at the trigger offset. Normal/Single drop records without an edge,
+  Auto shows them unaligned, Force accepts anything. The 2 junk samples are dropped (records are 252 samples).
+  Verified on hardware with ~660 mV p-p 50 Hz mains pickup: `build/smoke_test /dev/ttyUSB1:9600 3 trigger`
+  → 5/5 aligned on rising and falling edges.
+- Testing gotcha: smoke_test loads plugins from build/ AND ~/.scopehal/plugins; the one loaded last wins, so run
+  `cmake --install build` after every rebuild or you test a stale plugin.
 - MC drifts by itself (1991 at power-up, 1982 after writing 1991, later 1993): read it, don't assume it.
 
 ## Open questions / next tests (in this order)
 1. ~~Register writes~~, ~~settings reads~~, ~~waveform layout~~, ~~stale data~~ (GET 'C'), ~~TS formula~~ — done.
 2. Build the plugin against an ngscopeclient build (none installed on this PC yet) and try it end to end.
-3. Junk first two samples: drop them in the driver? Check what the 4 metadata bytes mean (byte 0 varies 00/10/20/30).
+3. ~~Junk samples~~ dropped. Check what the 4 metadata bytes mean (byte 0 varies 00/10/20/30).
 4. ~~Volt scale~~ (done). O1 bits (ground made no visible change at 10 V/div — retest at
    0.1 V/div with a signal), trigger S1/T1/TC with mains hum.
 5. Then the README's volt-scale, O1-bit and trigger tests.
