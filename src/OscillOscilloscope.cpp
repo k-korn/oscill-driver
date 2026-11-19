@@ -150,11 +150,11 @@ OscillOscilloscope::~OscillOscilloscope()
 		CancelPendingAcquisition();
 
 		//Leave the probe at its power-on rate, as the vendor software does
+		//(its ACK comes back at 9600 and would be garbage at our rate: just let the command go out)
 		if(m_port.GetBaudRate() != 9600)
 		{
-			Bytes reply;
 			SendFrame(BuildSetSpeed(9600));
-			ReadFrame(reply, 300, 300);
+			usleep(50 * 1000);
 		}
 	}
 }
@@ -312,26 +312,35 @@ bool OscillOscilloscope::ChangeBaudRate(unsigned int baud)
 		return false;
 	}
 
-	unsigned int oldBaud = m_port.GetBaudRate();
-	Bytes reply;
+	//Confirmed on hardware (fw 1.26): the probe acknowledges 0x91 already at the NEW rate, so the reply is garbage
+	//at the old one. Send, let it go out, switch the host, discard the garbled ACK, then verify with CONNECT
+	//(GET 'F' must not be used: this firmware rejects it).
 	CancelPendingAcquisition();
 	m_rxBuf.clear();
 	SendFrame(BuildSetSpeed(baud));
-	ReadFrame(reply, 500, 500);	//ACK may come at either rate; we don't rely on it
-	usleep(20 * 1000);
+	usleep(50 * 1000);
 
+	Bytes reply;
 	if(m_port.SetBaudRate(baud))
 	{
-		m_port.Drain();
-		m_rxBuf.clear();
-		if(Transact(BuildCommand(CMD_FIRMWARE), reply) && IsSuccess(reply))
+		for(int attempt = 0; attempt < 3; attempt++)
 		{
-			LogNotice("Oscill: link running at %u baud\n", baud);
-			return true;
+			m_port.Drain();
+			m_rxBuf.clear();
+			SendFrame(BuildConnect());
+			if(ReadFrame(reply, 500, 500) && IsSuccess(reply))
+			{
+				LogNotice("Oscill: link running at %u baud\n", baud);
+				return true;
+			}
 		}
 	}
 
-	LogWarning("Oscill: baud change to %u failed, reverting to %u\n", baud, oldBaud);
+	//Failed: the probe is most likely already at the new rate. Tell it to go back to 9600 at that rate first,
+	//then follow on the host side, so the two sides can't end up mismatched.
+	LogWarning("Oscill: baud change to %u failed, reverting to 9600\n", baud);
+	SendFrame(BuildSetSpeed(9600));
+	usleep(50 * 1000);
 	m_port.SetBaudRate(9600);
 	m_port.Drain();
 	m_rxBuf.clear();

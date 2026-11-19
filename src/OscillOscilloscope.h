@@ -15,7 +15,8 @@ class EdgeTrigger;
 /**
 	@brief Driver for the OKB ROSA "Oscill" DSO1 single channel pen oscilloscope (CP210x USB-UART, OBEX framing)
 
-	Connection: driver "oscill", transport "uart", path "/dev/ttyUSB0:9600".
+	Connection: driver "oscill", transport "uart", path "/dev/ttyUSB0:921600" (handshake at 9600, then the driver
+	switches the probe to the requested rate; confirmed on hardware, ~0.04 s per record vs ~0.33 s at 9600).
  */
 class OscillOscilloscope : public virtual SCPIOscilloscope
 {
@@ -153,7 +154,7 @@ public:
 	{
 		return
 		{
-			{"Oscill DSO1", {{ SCPITransportType::TRANSPORT_UART, "/dev/ttyUSB0:9600" }}}
+			{"Oscill DSO1", {{ SCPITransportType::TRANSPORT_UART, "/dev/ttyUSB0:921600" }}}
 		};
 	}
 	OSCILLOSCOPE_INITPROC(OscillOscilloscope)

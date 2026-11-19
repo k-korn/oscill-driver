@@ -40,9 +40,11 @@ cmake --install build      # copies liboscill.so to ~/.scopehal/plugins/
 ```
 
 To use it, add an oscilloscope in ngscopeclient with driver **`oscill`**, transport **`uart`** and path
-**`/dev/ttyUSB0:9600`**. Your user needs access to the port (the `dialout` group). To run the link faster, use e.g.
-`/dev/ttyUSB0:115200`: the driver does the handshake at 9600, switches the probe with opcode `0x91`, checks the new
-rate, and puts the probe back to 9600 on disconnect, as the vendor software does.
+**`/dev/ttyUSB0:921600`** (the Add Instrument dialog suggests this). Your user needs access to the port (`dialout` or
+`uucp`, depending on the distribution). The driver does the handshake at 9600, switches the probe to the requested rate
+with opcode `0x91`, checks it, and puts the probe back to 9600 on disconnect, as the vendor software does. 921600 is
+confirmed on hardware: a record takes ~0.04 s to transfer instead of ~0.33 s at 9600, which matters because triggering
+is done in software on each record. Any rate of the form 1843200/n works; use `:9600` to stay at the power-up rate.
 
 If no `/dev/ttyUSB*` appears, check `lsusb`. For a `10c4:840e` adapter, bind the cp210x driver by hand:
 

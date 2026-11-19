@@ -56,6 +56,14 @@ vendor's `oscill.exe` / `oscilink.dll`, with function addresses), `README.md` (b
   Auto shows them unaligned, Force accepts anything. The 2 junk samples are dropped (records are 252 samples).
   Verified on hardware with ~660 mV p-p 50 Hz mains pickup: `build/smoke_test /dev/ttyUSB1:9600 3 trigger`
   → 5/5 aligned on rising and falling edges.
+- **Fast link confirmed**: 921600 baud via opcode 0x91 (`91 00 04 02`) works; a 'D' record then takes ~0.04 s
+  instead of ~0.33 s at 9600. Driver default path is now `/dev/ttyUSB0:921600`; it also works in ngscopeclient.
+  The probe ACKs 0x91 already at the NEW rate (garbage at the old one), so don't read that reply; verify with
+  CONNECT. Never verify with GET 'F' (rejected by fw 1.26) — an earlier driver did, "failed", reverted only the host
+  side and left the probe stranded at 921600 (recover: connect at 921600, send `91 00 04 c0`).
+  Hardware trigger re-tested at 921600 with a clean spiky 50 Hz signal (spikes every 127 samples): in RT 1/2/3 the
+  spikes drift ~26 samples per capture exactly as in free run, independent of TC (50/200), S1 level/edge, and an
+  unreachable level still returns in 0.05 s → the hardware trigger has no effect; keep the software trigger.
 - Testing gotcha: smoke_test loads plugins from build/ AND ~/.scopehal/plugins; the one loaded last wins, so run
   `cmake --install build` after every rebuild or you test a stale plugin.
 - MC drifts by itself (1991 at power-up, 1982 after writing 1991, later 1993): read it, don't assume it.

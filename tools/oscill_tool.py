@@ -88,6 +88,11 @@ class Link:
     def connect(self):
         r = self.xfer(bytes.fromhex("80 00 07 10 00 10 00"))
         if not r or r[0] != 0xA0:
+            # opening the port can glitch the modem lines and briefly restart the probe: retry once
+            time.sleep(0.5)
+            self.s.reset_input_buffer()
+            r = self.xfer(bytes.fromhex("80 00 07 10 00 10 00"))
+        if not r or r[0] != 0xA0:
             sys.exit(f"no CONNECT response (got {hexs(r) if r else 'nothing'})")
         if "BOOT".encode("utf-16-be") in r:
             print("WARNING: probe reports BOOT state (bootloader, not the oscilloscope firmware). "
@@ -116,10 +121,18 @@ class Link:
         return self.xfer(packet(0x83, header(0x71, name.encode()) + bytes([MARKERS[typ]]) + v))
 
     def set_speed(self, baud):
-        r = self.xfer(packet(0x91, bytes([1843200 // baud])), 0.5)
-        time.sleep(0.02)
+        """Switch the link speed. The probe ACKs at the NEW rate, so the reply is not read; verify with
+        verify_link() afterwards."""
+        self.send(packet(0x91, bytes([1843200 // baud])))
+        self.s.flush()
+        time.sleep(0.05)
         self.s.baudrate = baud
-        return r
+        self.s.reset_input_buffer()
+
+    def verify_link(self):
+        """CONNECT is always answered (GET 'F' is rejected by fw 1.26)."""
+        r = self.xfer(bytes.fromhex("80 00 07 10 00 10 00"), 0.5)
+        return bool(r and r[0] == 0xA0)
 
     def capture(self, timeout=5.0):
         r = self.cmd("D", timeout)
@@ -185,7 +198,7 @@ def main():
     sw.add_argument("stop", type=int)
     sw.add_argument("--type", choices=list(MARKERS) + ["auto"], default="auto")
     sp = sub.add_parser("speed", help="switch link speed (1843200/n) and verify with GET 'F'")
-    sp.add_argument("baud", type=int)
+    sp.add_argument("new_baud", type=int, metavar="baud")
     raw = sub.add_parser("raw")
     raw.add_argument("bytes", nargs="+")
     args = ap.parse_args()
@@ -245,14 +258,17 @@ def main():
             else:
                 print(f"{args.reg}={v:4d} {ok} no waveform")
     elif args.cmd == "speed":
-        if 1843200 % args.baud:
+        if 1843200 % args.new_baud:
             sys.exit("baud must be 1843200/n")
-        print("0x91 reply:", hexs(link.set_speed(args.baud)) if link.s else "")
-        r = link.cmd("F")
-        print("GET 'F' at new speed:", hexs(r) if r else "no reply")
-        if r:
+        link.set_speed(args.new_baud)
+        if link.verify_link():
+            print(f"link works at {args.new_baud} baud")
             link.set_speed(9600)
-            print("reverted to 9600")
+            print("reverted to 9600:", "ok" if link.verify_link() else "NO ANSWER")
+        else:
+            print(f"no answer at {args.new_baud}; sending revert at that rate and returning to 9600")
+            link.set_speed(9600)
+            print("at 9600:", "ok" if link.verify_link() else "NO ANSWER - replug the probe")
     elif args.cmd == "raw":
         data = bytes(int(x, 16) for x in " ".join(args.bytes).split())
         r = link.xfer(data, 3.0)
