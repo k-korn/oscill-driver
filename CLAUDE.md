@@ -38,13 +38,16 @@ vendor's `oscill.exe` / `oscilink.dll`, with function addresses), `README.md` (b
 - In Auto mode with no trigger, 'D' answers at once with an empty body `a0 00 0a 72 00 04 44 49 00 03`.
 - **TS confirmed**: sample period = TS/256 × MC × 10 ps. TS 2030000, MC 1982 → 157.2 µs/sample; 50 Hz mains hum
   showed a 126-sample period (50.5 Hz). TMl/TMh (25/256) are NOT TS limits (meaning unknown).
+- **Volt scale confirmed** with a 1.361 V battery: V = (code − 128) × V1[mV]/1000 × 8/256. At 0.5 V/div:
+  shorted 128.2, + 215.0, reversed 42.2; reversed at 1 V/div 85.0, at 5 V/div 119.4 — all within 1% of prediction.
+  Noise ≈ ±2-3 codes. The very first capture after connecting the battery read low (input settling), repeats were stable.
 - MC drifts by itself (1991 at power-up, 1982 after writing 1991, later 1993): read it, don't assume it.
 
 ## Open questions / next tests (in this order)
 1. ~~Register writes~~, ~~settings reads~~, ~~waveform layout~~, ~~stale data~~ (GET 'C'), ~~TS formula~~ — done.
 2. Build the plugin against an ngscopeclient build (none installed on this PC yet) and try it end to end.
 3. Junk first two samples: drop them in the driver? Check what the 4 metadata bytes mean (byte 0 varies 00/10/20/30).
-4. Volt scale with a known DC source (battery), O1 bits (ground made no visible change at 10 V/div — retest at
+4. ~~Volt scale~~ (done). O1 bits (ground made no visible change at 10 V/div — retest at
    0.1 V/div with a signal), trigger S1/T1/TC with mains hum.
 5. Then the README's volt-scale, O1-bit and trigger tests.
 

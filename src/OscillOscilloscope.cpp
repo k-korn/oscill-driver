@@ -53,7 +53,8 @@ static const double g_voltsPerDiv[] = { 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.
 static const size_t g_numVoltRanges = sizeof(g_voltsPerDiv) / sizeof(g_voltsPerDiv[0]);
 static const size_t g_defaultVoltRange = 6;		//1 V/div
 
-//The 8-bit ADC spans the 8 screen divisions, with code 128 at 0 V (GUESS, consistent with the UI's +-range/2 limits)
+//The 8-bit ADC spans the 8 screen divisions, with code 128 at 0 V. Confirmed with a 1.361 V battery: 0.5 V/div gave
+//215.0 / 128.2 / 42.2 (+, shorted, reversed), 1 V/div gave 85.0 and 5 V/div 119.4 (reversed); within 1% everywhere.
 static const double g_adcDivisions = 8;
 static const int g_adcZeroCode = 128;
 
