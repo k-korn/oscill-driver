@@ -241,17 +241,23 @@ bool ParseRegisterReply(const Bytes& frame, const string& name, RegValue& out)
 	size_t pos = 3;
 	size_t end = frame.size();
 
-	//Unwrap 'p' / 'q' header
+	//Skip the echoed 'p' / 'q' name header. Confirmed on hardware (fw 1.26): the value follows it as a separate header,
+	//e.g. A0 00 0E | 70 00 06 'M' 'C' 'l' | F0 00 00 03 20
 	if( (frame[pos] == HDR_REG_READ) || (frame[pos] == HDR_REG_WRITE) )
 	{
 		if(end < pos + 3)
 			return false;
 		size_t hlen = ((size_t)frame[pos+1] << 8) | frame[pos+2];
-		if(hlen >= 3 && pos + hlen <= end)
-		{
-			end = pos + hlen;
-			pos += 3;
-		}
+		if(hlen < 3 || pos + hlen > end)
+			return false;
+		bool nameMatches = (hlen - 3 == name.size()) &&
+			(0 == name.compare(0, name.size(), (const char*)&frame[pos+3], name.size()));
+		if(!nameMatches && (pos + hlen < end))
+			return false;
+		if(pos + hlen < end)
+			pos += hlen;		//value header follows
+		else
+			pos += 3;			//legacy layout: value inside the header
 	}
 
 	//Strip echoed register name
@@ -298,6 +304,29 @@ bool ParseRegisterReply(const Bytes& frame, const string& name, RegValue& out)
 	out.kind = RegValue::STRING;
 	out.str = s;
 	return true;
+}
+
+/**
+	@brief The identity registers (VNM, VSN, VHW, VSW) hold four ASCII characters packed into a 4-byte value,
+	e.g. VSW = F1 31 2E 32 36 = "1.26". Returns that text, or "" if the value isn't printable ASCII.
+ */
+string RegValue::AsText() const
+{
+	if(kind == STRING)
+		return str;
+	if(kind != U32)
+		return "";
+	string s;
+	for(int shift = 24; shift >= 0; shift -= 8)
+	{
+		char c = (char)((u >> shift) & 0xff);
+		if(c == 0)
+			continue;
+		if(c < 0x20 || c > 0x7e)
+			return "";
+		s += c;
+	}
+	return s;
 }
 
 string HexDump(const Bytes& b, size_t maxBytes)

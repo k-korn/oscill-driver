@@ -142,7 +142,10 @@ def decode_value(name, r):
         return f"u8 {p[1]}"
     if len(p) >= 5 and p[0] in (0xF0, 0xF1):
         v = struct.unpack(">I", p[1:5])[0]
-        return f"{'u16' if p[0] == 0xF0 else 'u32'} {v}"
+        text = ""
+        if p[0] == 0xF1 and all(0x20 <= c < 0x7f for c in p[1:5]):
+            text = f"  ({p[1:5].decode()!r})"     # identity registers pack 4 ASCII characters
+        return f"{'u16' if p[0] == 0xF0 else 'u32'} {v}{text}"
     text = p.split(b"\x00")[0]
     return f"str {text.decode(errors='replace')!r}  [{hexs(r)}]"
 

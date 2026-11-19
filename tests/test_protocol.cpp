@@ -111,6 +111,41 @@ int main()
 		CHECK(!ParseRegisterReply(Bytes{0xD0, 0x00, 0x03}, "VNM", v));
 	}
 
+	//Register read replies captured from a real probe (fw 1.26): echoed 'p' name header, then a value header
+	{
+		RegValue v;
+		Bytes mcl{0xa0, 0x00, 0x0e, 0x70, 0x00, 0x06, 'M', 'C', 'l', 0xf0, 0x00, 0x00, 0x03, 0x20};
+		CHECK(ParseRegisterReply(mcl, "MCl", v));
+		CHECK(v.kind == RegValue::U16 && v.u == 800);
+
+		Bytes mcd{0xa0, 0x00, 0x0e, 0x70, 0x00, 0x06, 'M', 'C', 'd', 0xf0, 0x00, 0x00, 0x04, 0xe0};
+		CHECK(ParseRegisterReply(mcd, "MCd", v) && v.u == 1248);
+
+		Bytes vsw{0xa0, 0x00, 0x0e, 0x70, 0x00, 0x06, 'V', 'S', 'W', 0xf1, 0x31, 0x2e, 0x32, 0x36};
+		CHECK(ParseRegisterReply(vsw, "VSW", v));
+		CHECK(v.kind == RegValue::U32 && v.AsText() == "1.26");
+
+		Bytes vnm{0xa0, 0x00, 0x0e, 0x70, 0x00, 0x06, 'V', 'N', 'M', 0xf1, 0x55, 0x6f, 0x73, 0x63};
+		CHECK(ParseRegisterReply(vnm, "VNM", v) && v.AsText() == "Uosc");
+
+		//Reply for a different register must not be accepted
+		CHECK(!ParseRegisterReply(vnm, "VSN", v));
+
+		//Real error reply
+		CHECK(!ParseRegisterReply(Bytes{0xd0, 0x00, 0x03}, "MCl", v));
+
+		//Numbers are not text
+		Bytes num{0xa0, 0x00, 0x0e, 0x70, 0x00, 0x06, 'T', 'M', 'h', 0xf1, 0x01, 0x00, 0x00, 0x00};
+		CHECK(ParseRegisterReply(num, "TMh", v) && v.u == 0x01000000 && v.AsText().empty());
+	}
+
+	//GET 'F' reply captured from a real probe (first session): string wrapped in an End-of-Body (0x49) header
+	{
+		Bytes f{0xa0, 0x00, 0x1a, 0x72, 0x00, 0x04, 0x46, 0x49, 0x00, 0x13,
+			'U','o','s','c','1','.','2','5','3','4','0','4','1','.','2','1'};
+		CHECK(ParseFirmwareString(f) == "Uosc1.2534041.21");
+	}
+
 	if(g_failures)
 	{
 		printf("%d failure(s)\n", g_failures);

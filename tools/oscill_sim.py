@@ -21,7 +21,8 @@ import termios
 import time
 import tty
 
-STRING_REGS = {"VNM": "OKB ROSA", "VSN": "3404", "VHW": "2", "VSW": "1.25"}
+# Identity registers: 4 ASCII characters packed in an F1 value (as a real fw 1.26 probe answers)
+STRING_REGS = {"VNM": "Uosc", "VSN": "3404", "VHW": "1.25", "VSW": "1.26"}
 # MC* are in 10 ps units; TS = clocks per sample * 256, limited to [TMl, TMh]; V1 = mV/div
 NUM_REGS = {"MCl": 800, "MCh": 5425, "MCd": 1248, "MC": 1250, "TMl": 256, "TMh": 256 * 65536, "TOv": 1000,
             "O1": 0x02, "M1": 0, "T1": 0x20, "S1": 128, "TCh": 2000, "V1": 1000, "RT": 0, "TA": 128, "TC": 0, "TD": 172, "TS": 20480}
@@ -78,7 +79,8 @@ class Probe:
         if len(pkt) >= 7 and pkt[3] == 0x72:
             cmd = chr(pkt[6])
             if cmd == "F":
-                self.send(frame(0xA0, b"\x72\x00\x04F" + b"Uosc1.25340 41.21"))
+                # the real oscilloscope firmware (1.26) rejects GET 'F'
+                self.send(frame(0xD0))
             elif cmd == "C":
                 self.pending_d_at = None
                 self.send(bytes.fromhex("A0 00 03"))
@@ -124,17 +126,20 @@ class Probe:
             name = pkt[6:].decode(errors="replace")
             hdr_body = pkt[6:]
             if name in STRING_REGS:
-                hdr_body += STRING_REGS[name].encode() + b"\x00"
+                self.send(frame(0xA0, b"\x70" + struct.pack(">H", 3 + len(hdr_body)) + hdr_body +
+                                b"\xF1" + STRING_REGS[name].encode()[:4]))
+                return
             elif name in self.regs:
+                # value header follows the echoed name header, like a real probe (MCl: F0 00 00 03 20)
                 w = REG_WIDTH.get(name, 4)
-                hdr_body += {1: bytes([0xB1, self.regs[name] & 0xff]),
-                             2: b"\xF0" + struct.pack(">I", self.regs[name] & 0xffff)}.get(
+                value = {1: bytes([0xB1, self.regs[name] & 0xff]),
+                         2: b"\xF0" + struct.pack(">I", self.regs[name] & 0xffff)}.get(
                     w, b"\xF1" + struct.pack(">I", self.regs[name] & 0xffffffff))
+                self.send(frame(0xA0, b"\x70" + struct.pack(">H", 3 + len(hdr_body)) + hdr_body + value))
+                return
             else:
                 self.send(frame(0xD0))
                 return
-            self.send(frame(0xA0, b"\x70" + struct.pack(">H", 3 + len(hdr_body)) + hdr_body))
-            return
         self.send(frame(0xD0))
 
     def run(self):

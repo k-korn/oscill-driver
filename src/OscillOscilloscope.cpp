@@ -169,11 +169,17 @@ uint32_t OscillOscilloscope::GetInstrumentTypesForChannel(size_t /*i*/) const
 
 string OscillOscilloscope::IDPing()
 {
+	//GET 'F' is rejected by the oscilloscope firmware (it appears to be a bootloader command), so ping by reading
+	//the identity registers fresh
 	lock_guard<recursive_mutex> lock(m_mutex);
-	Bytes reply;
-	if(!Transact(BuildCommand(CMD_FIRMWARE), reply))
-		return "";
-	return ParseFirmwareString(reply);
+	string id;
+	RegValue v;
+	for(auto name : { "VNM", "VSN", "VSW" })
+	{
+		if(ReadRegister(name, v))
+			id += (id.empty() ? "" : " ") + v.AsText();
+	}
+	return id;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -228,27 +234,20 @@ bool OscillOscilloscope::Connect()
 	if(wantedBaud != m_port.GetBaudRate())
 		ChangeBaudRate(wantedBaud);
 
-	//Firmware ID string, e.g. "Uosc1.25340 41.21"
-	if(Transact(BuildCommand(CMD_FIRMWARE), reply))
-	{
-		m_idString = ParseFirmwareString(reply);
-		m_fwVersion = m_idString;
-		smatch m;
-		if(regex_search(m_idString, m, regex("osc([0-9]+\\.[0-9]+)")))
-			m_fwVersion = m[1];
-		LogNotice("Oscill: firmware ID \"%s\"\n", m_idString.c_str());
-	}
-
-	//Identity registers (best effort, exact read encoding unconfirmed)
+	//Identity registers: 4 ASCII characters each (confirmed on hardware: VNM "Uosc", VSN "3404", VHW "1.25",
+	//VSW "1.26"). GET 'F' is only answered in some states (probably by the bootloader), so it isn't used.
 	RegValue v;
-	if(ReadRegister("VNM", v) && v.kind == RegValue::STRING)
-		m_vendor = v.str;
+	string hw;
+	if(ReadRegister("VNM", v))
+		m_idString = v.AsText();
 	if(ReadRegister("VSN", v))
-		m_serial = (v.kind == RegValue::STRING) ? v.str : to_string(v.AsInt());
+		m_serial = v.AsText();
 	if(ReadRegister("VHW", v))
-		LogDebug("Oscill: hardware revision %s\n", v.kind == RegValue::STRING ? v.str.c_str() : to_string(v.AsInt()).c_str());
-	if(ReadRegister("VSW", v) && v.kind == RegValue::STRING)
-		m_fwVersion = v.str;
+		hw = v.AsText();
+	if(ReadRegister("VSW", v))
+		m_fwVersion = v.AsText();
+	LogNotice("Oscill: %s S/N %s, hardware %s, firmware %s\n",
+		m_idString.c_str(), m_serial.c_str(), hw.c_str(), m_fwVersion.c_str());
 
 	//Clock and timebase limits
 	for(auto name : { "MCl", "MCh", "MCd" })

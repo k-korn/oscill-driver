@@ -87,6 +87,8 @@ struct RegValue
 
 	int64_t AsInt() const
 	{ return (int64_t)u; }
+
+	std::string AsText() const;
 };
 
 ///@brief A decoded 'D' response

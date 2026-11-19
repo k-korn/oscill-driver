@@ -12,6 +12,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -76,6 +77,12 @@ bool OscillSerial::Attach(SCPITransport* transport)
 
 	m_fd = OscillUartAccess::Get(uart).GetHandle();
 
+	//Hold DTR and RTS low. With these lines toggling on open/close the probe was observed to reset into its
+	//bootloader ("BOOT" in the CONNECT reply); with them held low it stays in the oscilloscope firmware.
+	int lines = TIOCM_DTR | TIOCM_RTS;
+	if(0 != ioctl(m_fd, TIOCMBIC, &lines))
+		LogDebug("Oscill: could not clear DTR/RTS (%s)\n", strerror(errno));
+
 	//Remember the baud rate the user asked for in the connection string
 	auto cs = uart->GetConnectionString();
 	unsigned int baud = 9600;
@@ -105,7 +112,7 @@ bool OscillSerial::SetBaudRate(unsigned int baud)
 	}
 	cfmakeraw(&t);
 	t.c_cflag |= CLOCAL | CREAD;
-	t.c_cflag &= ~(CSTOPB | PARENB | CRTSCTS);
+	t.c_cflag &= ~(CSTOPB | PARENB | CRTSCTS | HUPCL);	//no HUPCL: don't drop DTR when the port closes
 	t.c_iflag &= ~(IXON | IXOFF | IXANY);
 	t.c_cc[VMIN] = 1;
 	t.c_cc[VTIME] = 0;
