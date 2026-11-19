@@ -25,12 +25,22 @@ vendor's `oscill.exe` / `oscilink.dll`, with function addresses), `README.md` (b
   VNM "Uosc", VSN "3404", VHW "1.25", VSW "1.26" (4 ASCII chars in an F1 value), MCl 800, MCh 5425, MCd 1248,
   TMl 25, TMh 256, TCh 252, QSh 254.
 - 'p' reads of the 2-letter settings registers (MC QS TS V1 O1 T1 S1 M1 RT TD TA TW) are rejected (`d0`).
+- **Settings registers are read with PUT + a name-only 'q' header**: `83 00 08 71 00 05 'RT'` →
+  `a0 00 0a 71 00 05 'RT' b1 00`. GET (0x82) with the same header just returns `a0 00 03`. Widths match the vendor
+  code exactly. Power-up values read: MC 1991, QS 254, TS 512, V1 10000 (mV/div), O1 0, T1 0x30, S1 127, M1 0,
+  RT 0, TD 0, TA 65280, TW 65280, AP 0, AR 1, RS 0. P1h/P1l rejected.
+- Register writes work; the reply echoes name + value (`a0 00 0a 71 00 05 'O1' b1 01`), not a bare `a0 00 03`.
+- GET 'D' reply: `a0 01 0c | 72 00 04 44 | 49 01 05 | 00 00 04 00 | 254 samples`. The "7 metadata bytes" of
+  the spec are the 3-byte End-of-Body header + 4 bytes (`00 00 04 00` so far). Sample count = QS (254).
+- **Problem:** in free-run mode the samples are all 255 except the first two (≈240, ≈67) and do not change with
+  O1 = 0/1/2/3 (ground made no difference). The ADC data isn't tracking the input — likely a start/arm step the
+  vendor app performs is missing. Unresolved.
 
 ## Open questions / next tests (in this order)
-1. Does a register write work now that the probe is out of BOOT? `tools/oscill_tool.py -p /dev/ttyUSB1 --dtr off --rts off -v write RT auto 0` (expect `a0 00 03`). The earlier failed write was sent while in BOOT.
-2. Read settings registers with a name-only 'q' header (oscilink.dll routine 0x11039690): `... -v raw 83 00 08 71 00 05 52 54` (RT), `... raw 83 00 08 71 00 05 54 53` (TS).
-3. First waveform with the tip shorted to ground: `... -v capture`. Check the reply layout (0x49 wrapper? 7 metadata bytes?) and sample count (QSh=254 suggests ≤254, not the spec's 344).
-4. Timebase: TMl/TMh = 25..256 contradicts "TS = clocks per sample × 256" for slow rates. Measure: write a few TS values, capture 50 Hz mains hum (touch the tip), count samples per period. Then fix `RateToTS`/`GetSampleRatesNonInterleaved` in the driver — **do not trust the current sample-rate list until this is done**.
+1. ~~Register writes~~ — work. 2. ~~Reading settings registers~~ — PUT + name-only 'q'. 3. ~~Waveform layout~~ — known.
+3b. Why the samples don't follow the input (see Problem above). Ideas: other 'r' commands the vendor app sends
+   before 'D'; the ADC needs RT/MC/TS rewritten after power-up; physical setup (battery, tip connection).
+4. Timebase (note: TS = 512 at power-up, i.e. above TMh = 256): TMl/TMh = 25..256 contradicts "TS = clocks per sample × 256" for slow rates. Measure: write a few TS values, capture 50 Hz mains hum (touch the tip), count samples per period. Then fix `RateToTS`/`GetSampleRatesNonInterleaved` in the driver — **do not trust the current sample-rate list until this is done**.
 5. Then the README's volt-scale, O1-bit and trigger tests.
 
 ## Building

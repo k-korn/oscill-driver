@@ -139,6 +139,35 @@ int main()
 		CHECK(ParseRegisterReply(num, "TMh", v) && v.u == 0x01000000 && v.AsText().empty());
 	}
 
+	//Settings register query and replies captured from a real probe (fw 1.26)
+	{
+		CHECK(BuildRegisterQuery("RT") == (Bytes{0x83, 0x00, 0x08, 0x71, 0x00, 0x05, 'R', 'T'}));
+		RegValue v;
+		Bytes rt{0xa0, 0x00, 0x0a, 0x71, 0x00, 0x05, 'R', 'T', 0xb1, 0x00};
+		CHECK(ParseRegisterReply(rt, "RT", v) && v.kind == RegValue::U8 && v.u == 0);
+		Bytes ts{0xa0, 0x00, 0x0d, 0x71, 0x00, 0x05, 'T', 'S', 0xf1, 0x00, 0x00, 0x02, 0x00};
+		CHECK(ParseRegisterReply(ts, "TS", v) && v.kind == RegValue::U32 && v.u == 512);
+		Bytes mc{0xa0, 0x00, 0x0d, 0x71, 0x00, 0x05, 'M', 'C', 0xf0, 0x00, 0x00, 0x07, 0xbe};	//write echo: 1991 -> 1982
+		CHECK(ParseRegisterReply(mc, "MC", v) && v.kind == RegValue::U16 && v.u == 1982);
+	}
+
+	//GET 'D' replies captured from a real probe: 4 metadata bytes + QS (254) samples inside an End-of-Body header,
+	//or an empty body while nothing has triggered (Auto mode)
+	{
+		Bytes d{0xa0, 0x01, 0x0c, 0x72, 0x00, 0x04, 0x44, 0x49, 0x01, 0x05, 0x20, 0x00, 0x04, 0x00};
+		for(int i=0; i<254; i++)
+			d.push_back(128);
+		CHECK(d.size() == 0x10c);
+		WaveformFrame wf;
+		CHECK(ParseWaveform(d, wf));
+		CHECK(wf.samples.size() == 254);
+		CHECK(wf.metadata.size() == 7 && wf.metadata[3] == 0x20);
+
+		Bytes empty{0xa0, 0x00, 0x0a, 0x72, 0x00, 0x04, 0x44, 0x49, 0x00, 0x03};
+		CHECK(IsCommandReply(empty, 'D'));
+		CHECK(!ParseWaveform(empty, wf));
+	}
+
 	//GET 'F' reply captured from a real probe (first session): string wrapped in an End-of-Body (0x49) header
 	{
 		Bytes f{0xa0, 0x00, 0x1a, 0x72, 0x00, 0x04, 0x46, 0x49, 0x00, 0x13,

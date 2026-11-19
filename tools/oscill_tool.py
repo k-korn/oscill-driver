@@ -98,7 +98,13 @@ class Link:
         return self.xfer(packet(0x82, header(0x72, c.encode())), timeout)
 
     def read_reg(self, name):
-        return self.xfer(packet(0x83, header(0x70, name.encode())))
+        # 3-letter names are read-only constants ('p' read); 2-letter names are settings, read with a name-only 'q'
+        hid = 0x70 if len(name) >= 3 else 0x71
+        return self.xfer(packet(0x83, header(hid, name.encode())))
+
+    def cancel(self):
+        # GET 'C' resets the acquisition; without it a freshly connected probe returned a stale all-255 buffer
+        return self.cmd("C")
 
     def write_reg(self, name, typ, value):
         if typ == "u8":
@@ -125,6 +131,8 @@ class Link:
             return None
         hl = struct.unpack(">H", r[4:6])[0]
         body = r[3 + hl:]
+        if len(body) <= 7:
+            return "empty"      # 49 00 03: nothing triggered yet (Auto/Normal mode)
         return body[:7], body[7:]
 
 
@@ -170,6 +178,7 @@ def main():
     c.add_argument("--count", type=int, default=1)
     c.add_argument("--csv")
     c.add_argument("--timeout", type=float, default=5.0)
+    c.add_argument("--no-cancel", action="store_true", help="don't send GET 'C' before the first capture")
     sw = sub.add_parser("sweep")
     sw.add_argument("reg")
     sw.add_argument("start", type=int)
@@ -199,8 +208,17 @@ def main():
         print("reply:", hexs(r) if r else "none", "(OK)" if r and r[0] == 0xA0 else "")
     elif args.cmd == "capture":
         rows = []
+        if not args.no_cancel:
+            link.cancel()
         for i in range(args.count):
+            deadline = time.time() + args.timeout
             res = link.capture(args.timeout)
+            while res == "empty" and time.time() < deadline:
+                time.sleep(0.05)
+                res = link.capture(args.timeout)
+            if res == "empty":
+                print(f"#{i}: no trigger within {args.timeout} s")
+                continue
             if not res:
                 print(f"#{i}: no waveform (timeout, sent cancel)")
                 continue
@@ -219,8 +237,9 @@ def main():
             typ = REG_TYPE.get(args.reg, "u32") if args.type == "auto" else args.type
             wr = link.write_reg(args.reg, typ, v)
             ok = "ok " if wr and wr[0] == 0xA0 else "ERR"
+            link.cancel()
             res = link.capture()
-            if res:
+            if res and res != "empty":
                 meta, s = res
                 print(f"{args.reg}={v:4d} {ok} meta [{meta.hex(' ')}] min={min(s):3d} max={max(s):3d}")
             else:

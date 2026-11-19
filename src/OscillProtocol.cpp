@@ -86,6 +86,17 @@ Bytes BuildRegisterRead(const string& name)
 	return BuildPacket(OP_PUT, NameHeader(HDR_REG_READ, name));
 }
 
+/**
+	@brief Reads a settings (2-letter, read/write) register: PUT with a name-only 'q' header.
+
+	Confirmed on hardware (fw 1.26): 83 00 08 71 00 05 'RT' -> A0 00 0A 71 00 05 'RT' B1 00. The 'p' read only works
+	for the 3-letter read-only registers (MCl, TMh, VNM, ...).
+ */
+Bytes BuildRegisterQuery(const string& name)
+{
+	return BuildPacket(OP_PUT, NameHeader(HDR_REG_WRITE, name));
+}
+
 Bytes BuildRegisterWrite1(const string& name, uint8_t value)
 {
 	auto body = NameHeader(HDR_REG_WRITE, name);

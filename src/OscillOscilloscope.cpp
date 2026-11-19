@@ -61,8 +61,8 @@ static const int g_adcZeroCode = 128;
 //MCU clock period = MC * 10 ps (MCl / MCh give the legal MC range).
 static const int64_t MC_UNIT_FS			= 10000;		//10 ps
 static const uint32_t DEFAULT_MC		= 1250;			//12.5 ns / 80 MHz, used if MC can't be read
-static const uint32_t DEFAULT_TS_MIN	= 256;			//one sample per clock, used if TMl can't be read
-static const uint32_t DEFAULT_TS_MAX	= 256u * 1000000u;
+static const uint32_t DEFAULT_TS_MIN	= 256;			//one sample per clock (faster needs RIS, not supported)
+static const uint32_t DEFAULT_TS_MAX	= 0x7fffffff;	//4-byte register; ~1 sample per 2 s at 80 MHz
 static const uint64_t DEFAULT_SAMPLE_RATE = 1000000;
 
 
@@ -234,6 +234,11 @@ bool OscillOscilloscope::Connect()
 	if(wantedBaud != m_port.GetBaudRate())
 		ChangeBaudRate(wantedBaud);
 
+	//GET 'C' resets the acquisition engine. Confirmed on hardware: without it, GET 'D' kept returning a stale
+	//buffer (all 255) that ignored every setting; after one 'C' the samples follow the input.
+	if(!Transact(BuildCommand(CMD_CANCEL), reply))
+		LogWarning("Oscill: no reply to the initial cancel\n");
+
 	//Identity registers: 4 ASCII characters each (confirmed on hardware: VNM "Uosc", VSN "3404", VHW "1.25",
 	//VSW "1.26"). GET 'F' is only answered in some states (probably by the bootloader), so it isn't used.
 	RegValue v;
@@ -257,22 +262,31 @@ bool OscillOscilloscope::Connect()
 	}
 	if( (ReadRegister("MC", v) || ReadRegister("MCd", v)) && v.IsNumeric() && v.u > 0)
 		m_mc = v.u;
-	if(ReadRegister("TMl", v) && v.IsNumeric() && v.u > 0)
-		m_tsMin = v.u;
-	if(ReadRegister("TMh", v) && v.IsNumeric() && v.u >= m_tsMin)
-		m_tsMax = v.u;
+
+	//TMl / TMh (25 / 256 on fw 1.26) are NOT the TS limits: the probe accepted TS = 2030000 and sampled at the
+	//expected rate. Their meaning is unknown; logged only.
+	for(auto name : { "TMl", "TMh", "QSh" })
+	{
+		if(ReadRegister(name, v) && v.IsNumeric())
+			LogDebug("Oscill: %s = %u\n", name, v.u);
+	}
 	if(ReadRegister("TCh", v) && v.IsNumeric() && v.u > 0)
 		m_tcMax = v.u;
+	if(ReadRegister("QS", v) && v.IsNumeric() && v.u > 0)
+		m_lastDepth = v.u;
+	if(ReadRegister("TS", v) && v.IsNumeric() && v.u > 0)
+	{
+		m_ts = v.u;
+		m_sampleRate = (uint64_t)llround(TSToRate(m_ts));
+	}
 
 	//Keep the bits we don't control (input filters, trigger hysteresis) as the probe has them
 	if(ReadRegister("O1", v) && v.IsNumeric())
 		m_o1 = (uint8_t)v.u;
 	if(ReadRegister("T1", v) && v.IsNumeric())
 		m_t1 = (uint8_t)v.u;
-	LogDebug("Oscill: MCU clock %.3f MHz, TS range %u..%u (%.6g .. %.6g S/s)\n",
-		1e9 / (m_mc * MC_UNIT_FS), m_tsMin, m_tsMax,
-		TSToRate(m_tsMax), TSToRate(m_tsMin));
-	m_ts = RateToTS(m_sampleRate);
+	LogDebug("Oscill: MCU clock %.3f MHz, TS %u (%.6g S/s), %llu samples\n",
+		1e9 / (m_mc * MC_UNIT_FS), m_ts, TSToRate(m_ts), (unsigned long long)m_lastDepth);
 
 	return true;
 }
@@ -419,8 +433,10 @@ bool OscillOscilloscope::Transact(const Bytes& request, Bytes& reply, int timeou
 
 bool OscillOscilloscope::ReadRegister(const string& name, RegValue& value)
 {
+	//3-letter names are read-only constants ('p' read); 2-letter names are settings (name-only 'q' query)
 	Bytes reply;
-	if(!Transact(BuildRegisterRead(name), reply))
+	auto request = (name.size() >= 3) ? BuildRegisterRead(name) : BuildRegisterQuery(name);
+	if(!Transact(request, reply))
 		return false;
 	if(!IsSuccess(reply))
 	{
@@ -659,27 +675,16 @@ double OscillOscilloscope::TSToRate(uint32_t ts)
 }
 
 /**
-	@brief Converts a sample rate into a TS value the way oscill.exe does (function at 0x4c0a30, real-time branch):
-		x  = 256 * Tsample / Tclock
-		k  = max(2, ceil(2*TMh / (x + 1)))
-		TS = max(TMl, (2*TMh) div k)
+	@brief TS = sample period in MCU clocks x 256.
+
+	Confirmed on hardware: TS = 2030000 with MC = 1982 (19.82 ns) gave 157.2 us/sample and showed 50 Hz mains hum
+	with a 126-sample period (50.5 Hz).
  */
 uint32_t OscillOscilloscope::RateToTS(uint64_t rate)
 {
-	double x = 256.0 * FS_PER_SECOND / ((double)rate * m_mc * MC_UNIT_FS);
-	double twoN = 2.0 * m_tsMax;
-	double a = twoN / (x + 1);
-	double k = floor(a);
-	if(k + 0.01 < a)
-		k += 1;
-	if(k < 2)
-		k = 2;
-	double ts = floor(twoN / llround(k));
-	if(ts < m_tsMin)
-		ts = m_tsMin;
-	if(ts > m_tsMax)
-		ts = m_tsMax;
-	return (uint32_t)ts;
+	double ts = 256.0 * FS_PER_SECOND / ((double)rate * m_mc * MC_UNIT_FS);
+	ts = max((double)m_tsMin, min((double)m_tsMax, ts));
+	return (uint32_t)llround(ts);
 }
 
 EdgeTrigger* OscillOscilloscope::GetEdgeTrigger()
@@ -830,6 +835,14 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 	Bytes f;
 	if(ReadFrame(f, POLL_TIMEOUT_MS))
 	{
+		//In Auto / Normal mode the probe answers at once with an empty body (49 00 03) while nothing has triggered:
+		//ask again on the next poll
+		WaveformFrame probe;
+		if(IsCommandReply(f, CMD_DATA) && !ParseWaveform(f, probe))
+		{
+			m_requestOutstanding = false;
+			return m_autoMode ? TRIGGER_MODE_AUTO : TRIGGER_MODE_WAIT;
+		}
 		if(IsCommandReply(f, CMD_DATA))
 		{
 			m_frame.swap(f);

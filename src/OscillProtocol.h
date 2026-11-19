@@ -102,6 +102,7 @@ struct WaveformFrame
 Bytes BuildConnect(uint16_t maxPacket = 0x1000);
 Bytes BuildCommand(char cmd);
 Bytes BuildRegisterRead(const std::string& name);
+Bytes BuildRegisterQuery(const std::string& name);
 Bytes BuildRegisterWrite1(const std::string& name, uint8_t value);
 Bytes BuildRegisterWrite2(const std::string& name, uint16_t value);
 Bytes BuildRegisterWrite4(const std::string& name, uint32_t value);
