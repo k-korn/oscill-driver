@@ -13,7 +13,7 @@ OBEX-style framing), reverse-engineered from the vendor's Windows software and v
 Verified with ngscopeclient (scopehal-apps 0.3) and a real probe:
 
 * identification, register access, link speed up to 921600 baud;
-* volts/div 20 mV–10 V, sample rates via the `TS` clock divider (volt and time scales checked within 1%);
+* volts/div 20 mV–10 V, sample rates 100 S/s–25 MS/s (volt and time scales checked within 1%);
 * DC / AC / GND coupling, the probe's ~3 MHz low-pass ("Filt L") and ~3 kHz high-pass ("Filt H") as ADC modes;
 * Run / Single / Auto / Force / Stop with a **software edge trigger** (rising, falling, either; level and position):
   the probe's hardware trigger has no effect on this firmware.

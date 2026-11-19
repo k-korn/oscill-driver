@@ -97,7 +97,7 @@ int main(int argc, char** argv)
 
 	if(argc < 2)
 	{
-		LogError("usage: %s /dev/ttyUSB0:921600 [count] [trigger|filters|stress]\n", argv[0]);
+		LogError("usage: %s /dev/ttyUSB0:921600 [count] [trigger|filters|stress|slow]\n", argv[0]);
 		return 2;
 	}
 	int count = (argc > 2) ? atoi(argv[2]) : 3;
@@ -130,6 +130,53 @@ int main(int argc, char** argv)
 		scope->GetVendor().c_str(), scope->GetName().c_str(), scope->GetSerial().c_str(), scope->IDPing().c_str());
 
 	bool ok = true;
+
+	if( (argc > 3) && (string(argv[3]) == "slow") )
+	{
+		//Slow timebase: a GET 'D' reply only comes after a whole fresh record (~2.5 s at 100 S/s), and the probe
+		//ignores commands meanwhile. The capture must arrive (no watchdog cancel); Stop during a pending record must
+		//wait for that record (at most its duration) and leave the link in sync for the next command.
+		LogNotice("--- slow timebase (100 S/s) ---\n");
+		scope->SetSampleRate(100);
+		double rec = scope->GetSampleDepth() / (double)scope->GetSampleRate();
+		LogNotice("  rate %llu S/s, %llu samples: record %.1f s\n",
+			(unsigned long long)scope->GetSampleRate(), (unsigned long long)scope->GetSampleDepth(), rec);
+		bool ok = true;
+
+		scope->ForceTrigger();
+		double t0 = GetTime(), got = -1;
+		while(GetTime() - t0 < 4 * rec + 10)
+		{
+			if(scope->PollTrigger() == Oscilloscope::TRIGGER_MODE_TRIGGERED && scope->AcquireData())
+			{
+				scope->PopPendingWaveform();
+				got = GetTime() - t0;
+				break;
+			}
+		}
+		LogNotice("  forced capture: %s\n", got < 0 ? "NONE" : ("after " + to_string(got) + " s").c_str());
+		ok &= (got > 0);
+
+		scope->StartAutoTrigger();
+		for(int k = 0; k < 20; k++)
+			scope->PollTrigger();			//request outstanding, probe acquiring
+		double s0 = GetTime();
+		scope->Stop();
+		double stopTime = GetTime() - s0;
+		LogNotice("  Stop() during a pending record took %.2f s\n", stopTime);
+		ok &= (stopTime < rec + 1.5);
+
+		//The link must still be in sync: change the rate back and check it took effect
+		scope->SetSampleRate(100000);
+		LogNotice("  rate after Stop: %llu S/s\n", (unsigned long long)scope->GetSampleRate());
+		ok &= (scope->GetSampleRate() == 100000);
+		LogNotice("%s\n", ok ? "SLOW TEST PASSED" : "SLOW TEST FAILED");
+		scope = nullptr;
+		ScopehalStaticCleanup();
+		fflush(stdout);
+		fflush(stderr);
+		_exit(ok ? 0 : 1);
+	}
 
 	if( (argc > 3) && (string(argv[3]) == "stress") )
 	{

@@ -10,7 +10,6 @@
 
 #include <cmath>
 #include <algorithm>
-#include <regex>
 #include <unistd.h>
 
 using namespace std;
@@ -23,18 +22,13 @@ using namespace oscill;
 // and verified on hardware where noted (see docs/Protocol.md). Items marked GUESS have not been confirmed.
 //   1 byte: O1 M1 T1 S1 RT AP AR RS   2 bytes: MC V1 QS TC   4 bytes: TS TD TA TW
 
-//Run modes written to the RT register. The driver only uses RUN_FREE (0, verified); the other values follow the
-//original guess and are unconfirmed (see docs/Protocol.md, "Trigger").
-enum RunMode : uint8_t
-{
-	RUN_FREE	= 0,
-	RUN_AUTO	= 1,
-	RUN_NORMAL	= 2,
-	RUN_WAIT	= 3
-};
+//Neutral state written once at connect. The hardware trigger has no effect on fw 1.26 (triggering is done in
+//software), so the probe is kept in free run (RT = 0, verified), plain sampling (M1 = 0, the power-up value; the
+//vendor app may leave Average / Peak selected), no pre-trigger count and no delay.
+static const uint8_t RT_FREE_RUN	= 0;
+static const uint8_t M1_SAMPLE		= 0;
 
-//O1 = input option bits (oscill.exe 0x4b4f50). M1 is the acquisition mode (sample/avg/hires/peak), not coupling,
-//so the driver leaves M1 alone.
+//O1 = input option bits (oscill.exe 0x4b4f50).
 //Confirmed with a 1.36 V battery at 0.5 V/div: O1=0 reads 214 (DC), O1=2 reads 128 (DC blocked, AC signals still pass:
 //AC coupling), O1=1 and 3 read a noiseless 128 (input grounded).
 static const uint8_t O1_GROUND		= 0x01;
@@ -52,23 +46,12 @@ static const uint8_t O1_FILTERS			= O1_LOWPASS_3MHZ | O1_HIGHPASS_3KHZ;
 enum FilterMode { FILTER_NONE = 0, FILTER_LOWPASS = 1, FILTER_HIGHPASS = 2, FILTER_BANDPASS = 3 };
 static const uint8_t g_filterBits[] = { 0, O1_LOWPASS_3MHZ, O1_HIGHPASS_3KHZ, O1_LOWPASS_3MHZ | O1_HIGHPASS_3KHZ };
 
-//T1 = trigger configuration (oscill.exe 0x4b7770)
-static const uint8_t T1_HYST_MASK	= 0x0f;		//bits 0-1 fall hysteresis, bits 2-3 rise hysteresis
-static const uint8_t T1_FALLING		= 0x10;
-static const uint8_t T1_RISING		= 0x20;
-static const uint8_t T1_EDGE_MASK	= T1_FALLING | T1_RISING;
-
-//Timer registers (TD trigger delay, TA / TW auto / wait timeouts) count units of 12000 MCU clocks
-static const double TIMER_TICK_CLOCKS = 12000;
-static const double AUTO_TIMEOUT_S = 0.1;		//Auto mode: free-run after this long without a trigger
-
 //Software trigger (the hardware trigger does not gate captures on fw 1.26; see docs/Protocol.md)
 static const size_t JUNK_SAMPLES = 2;			//first samples of every record are garbage (~250, ~66)
 static const double SW_TRIGGER_HYST_CODES = 3;	//noise is about +-2..3 codes
 
 //Vertical scale. V1 = volts/div in millivolts (oscill.exe: V1 = range * 1000 / 8, 8 divisions full screen).
-//The 1-2-5 steps match the vendor UI; the exact span the hardware accepts is not known.
-//Same steps as the vendor app (20 mV/div .. 10 V/div)
+//Same 1-2-5 steps as the vendor app (20 mV/div .. 10 V/div).
 static const double g_voltsPerDiv[] = { 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0 };
 static const size_t g_numVoltRanges = sizeof(g_voltsPerDiv) / sizeof(g_voltsPerDiv[0]);
 static const size_t g_defaultVoltRange = 5;		//1 V/div
@@ -78,19 +61,22 @@ static const size_t g_defaultVoltRange = 5;		//1 V/div
 static const double g_adcDivisions = 8;
 static const int g_adcZeroCode = 128;
 
-//Timebase (oscill.exe): TS = sample period in MCU clock cycles, 8.8 fixed point, limited to [TMl, TMh].
-//MCU clock period = MC * 10 ps (MCl / MCh give the legal MC range).
+//Timebase (verified): sample period = TS / 256 x MC x 10 ps. The probe applies whole clocks at fast rates (TS 514 ->
+//512, 12845 -> 12800), so the value it echoes is used. TMl / TMh are NOT TS limits.
 static const int64_t MC_UNIT_FS			= 10000;		//10 ps
-static const uint32_t DEFAULT_MC		= 1250;			//12.5 ns / 80 MHz, used if MC can't be read
-static const uint32_t DEFAULT_TS_MIN	= 256;			//one sample per clock (faster needs RIS, not supported)
-static const uint32_t DEFAULT_TS_MAX	= 0x7fffffff;	//4-byte register; ~1 sample per 2 s at 80 MHz
-static const uint64_t DEFAULT_SAMPLE_RATE = 1000000;
+static const uint32_t DEFAULT_MC		= 1991;			//power-up value seen (~50 MHz); MC drifts, so it is re-read
+static const uint32_t DEFAULT_TS		= 512;			//power-up value: 2 clocks per sample, ~25 MS/s
+static const uint32_t TS_MIN			= 512;			//fastest rate tested (TS 256 = 1 sample / clock is untested)
+static const uint64_t MIN_SAMPLE_RATE	= 100;			//GET 'D' waits for a fresh record, and the probe ignores
+														//commands meanwhile: 2.5 s at 100 S/s
 
 
 //Timeouts
 static const int CONNECT_TIMEOUT_MS		= 1000;
-static const int POLL_TIMEOUT_MS		= 50;		//how long one PollTrigger() call may block
-static const double FREERUN_WATCHDOG_S	= 5.0;		//free-run / auto replies should never take this long
+static const int POLL_TIMEOUT_MS		= 50;		//how long one PollTrigger() call may block waiting for a reply
+static const double CANCEL_MARGIN_S		= 1.0;		//extra wait for an outstanding record beyond its expected time
+static const double WATCHDOG_MARGIN_S	= 5.0;		//a 'D' reply comes one record duration after the request; allow
+													//twice that plus this margin before giving up on it
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Construction / destruction
@@ -104,25 +90,21 @@ OscillOscilloscope::OscillOscilloscope(SCPITransport* transport)
 	, m_autoMode(false)
 	, m_forceNext(false)
 	, m_requestTime(0)
-	, m_currentRunMode(-1)
 	, m_channelEnabled(true)
 	, m_coupling(OscilloscopeChannel::COUPLE_DC_1M)
 	, m_attenuation(1)
 	, m_offset(0)
 	, m_vrangeIndex(g_defaultVoltRange)
 	, m_mc(DEFAULT_MC)
-	, m_tsMin(DEFAULT_TS_MIN)
-	, m_tsMax(DEFAULT_TS_MAX)
-	, m_ts(0)
-	, m_sampleRate(DEFAULT_SAMPLE_RATE)
-	, m_tcMax(0xffff)
+	, m_ts(DEFAULT_TS)
+	, m_qs(DEFAULT_RECORD_LEN)
+	, m_sampleRate(0)
 	, m_o1(0)
-	, m_t1(0)
 	, m_triggerOffset(0)
 	, m_swTriggerPhase(0)
 	, m_swTrigLevel(0)
 	, m_swTrigEdges(EDGE_RISING_BIT)
-	, m_lastDepth(NOMINAL_SAMPLE_COUNT)
+	, m_lastDepth(DEFAULT_RECORD_LEN - JUNK_SAMPLES)
 	, m_regWriteFailures(0)
 {
 	m_vendor = "OKB ROSA";
@@ -130,7 +112,7 @@ OscillOscilloscope::OscillOscilloscope(SCPITransport* transport)
 	m_serial = "";
 	m_fwVersion = "";
 
-	m_ts = RateToTS(m_sampleRate);
+	m_sampleRate = NominalRate(m_ts);
 
 	m_channels.push_back(new OscilloscopeChannel(
 		this,
@@ -140,9 +122,6 @@ OscillOscilloscope::OscillOscilloscope(SCPITransport* transport)
 		Unit(Unit::UNIT_VOLTS),
 		Stream::STREAM_TYPE_ANALOG,
 		0));
-
-	//Trigger point in the middle of the record by default
-	m_triggerOffset = GetSamplePeriodFs() * (int64_t)(NOMINAL_SAMPLE_COUNT / 2);
 
 	lock_guard<recursive_mutex> lock(m_mutex);
 	if(!m_port.Attach(transport))
@@ -155,9 +134,8 @@ OscillOscilloscope::OscillOscilloscope(SCPITransport* transport)
 		return;
 	}
 
-	//Trigger point in the middle of the record actually delivered (QS minus the junk samples)
-	if(m_lastDepth > JUNK_SAMPLES)
-		m_triggerOffset = GetSamplePeriodFs() * (int64_t)((m_lastDepth - JUNK_SAMPLES) / 2);
+	//Trigger point in the middle of the record actually delivered
+	m_triggerOffset = GetSamplePeriodFs() * (int64_t)(m_lastDepth / 2);
 
 	PullTrigger();
 	PushAll();
@@ -282,48 +260,41 @@ bool OscillOscilloscope::Connect()
 	LogNotice("Oscill: %s S/N %s, hardware %s, firmware %s\n",
 		m_idString.c_str(), m_serial.c_str(), hw.c_str(), m_fwVersion.c_str());
 
-	//Clock and timebase limits
-	for(auto name : { "MCl", "MCh", "MCd" })
-	{
-		if(ReadRegister(name, v) && v.IsNumeric())
-			LogDebug("Oscill: %s = %lld (x10 ps)\n", name, (long long)v.AsInt());
-	}
-	if( (ReadRegister("MC", v) || ReadRegister("MCd", v)) && v.IsNumeric() && v.u > 0)
-		m_mc = v.u;
-
-	//TMl / TMh (25 / 256 on fw 1.26) are NOT the TS limits: the probe accepted TS = 2030000 and sampled at the
-	//expected rate. Their meaning is unknown; logged only.
-	for(auto name : { "TMl", "TMh", "QSh" })
+	//Limits, logged for diagnostics. TMl / TMh are not TS limits (meaning unknown); QSh, the longest record, depends
+	//on the sample rate (254 at 25 MS/s, 1788 at <= 1 MS/s).
+	for(auto name : { "MCl", "MCh", "MCd", "TMl", "TMh", "TCh", "QSh" })
 	{
 		if(ReadRegister(name, v) && v.IsNumeric())
 			LogDebug("Oscill: %s = %u\n", name, v.u);
 	}
-	if(ReadRegister("TCh", v) && v.IsNumeric() && v.u > 0)
-		m_tcMax = v.u;
-	if(ReadRegister("QS", v) && v.IsNumeric() && v.u > 0)
-		m_lastDepth = v.u;
-	if(ReadRegister("TS", v) && v.IsNumeric() && v.u > 0)
-	{
-		m_ts = v.u;
-		m_sampleRate = (uint64_t)llround(TSToRate(m_ts));
-	}
 
-	//Keep the bits we don't control (input filters, trigger hysteresis) as the probe has them
+	//Start from the probe's current state rather than overwriting it with defaults
+	if(ReadRegister("V1", v) && v.IsNumeric() && v.u > 0)
+		m_vrangeIndex = NearestVoltRange(v.u / 1000.0);
 	if(ReadRegister("O1", v) && v.IsNumeric())
+	{
 		m_o1 = (uint8_t)v.u;
-	if(ReadRegister("T1", v) && v.IsNumeric())
-		m_t1 = (uint8_t)v.u;
-	LogDebug("Oscill: MCU clock %.3f MHz, TS %u (%.6g S/s), %llu samples\n",
-		1e9 / (m_mc * MC_UNIT_FS), m_ts, TSToRate(m_ts), (unsigned long long)m_lastDepth);
+		if(m_o1 & O1_GROUND)
+			m_coupling = OscilloscopeChannel::COUPLE_GND;
+		else if(m_o1 & O1_AC)
+			m_coupling = OscilloscopeChannel::COUPLE_AC_1M;
+		else
+			m_coupling = OscilloscopeChannel::COUPLE_DC_1M;
+	}
+	if(ReadRegister("TS", v) && v.IsNumeric() && v.u > 0)
+		m_ts = v.u;
+	ReadTimebaseState();
+	m_sampleRate = NominalRate(m_ts);
+
+	LogDebug("Oscill: %.3f V/div, O1 0x%02x, MCU clock %.3f MHz, TS %u (%.6g S/s), %llu samples per record\n",
+		g_voltsPerDiv[m_vrangeIndex], m_o1, 1e9 / (m_mc * MC_UNIT_FS), m_ts, TSToRate(m_ts),
+		(unsigned long long)m_lastDepth);
 
 	return true;
 }
 
 /**
-	@brief Switches probe and host to a new baud rate (opcode 0x91, recovered from oscilink.dll).
-
-	The probe derives its rate as 1843200 / divisor. We send the request at the current rate, accept whatever comes
-	back, switch the host side and verify with GET 'F'. On failure we drop back to 9600 and redo the handshake.
+	@brief Switches probe and host to a new baud rate (opcode 0x91): rate = 1843200 / divisor.
  */
 bool OscillOscilloscope::ChangeBaudRate(unsigned int baud)
 {
@@ -483,7 +454,7 @@ bool OscillOscilloscope::ReadRegister(const string& name, RegValue& value)
 	return ParseRegisterReply(reply, name, value);
 }
 
-bool OscillOscilloscope::WriteRegister(const string& name, const Bytes& request)
+bool OscillOscilloscope::WriteRegister(const string& name, const Bytes& request, RegValue* applied)
 {
 	if(!m_connected)
 		return false;
@@ -491,9 +462,14 @@ bool OscillOscilloscope::WriteRegister(const string& name, const Bytes& request)
 	//Any frame we were holding was captured with the old settings
 	m_frameReady = false;
 
+	//The reply echoes the value the probe actually applied (e.g. TS 514 -> 512, MC 1991 -> 1982)
 	Bytes reply;
 	if(Transact(request, reply) && IsSuccess(reply))
+	{
+		if(applied && !ParseRegisterReply(reply, name, *applied))
+			applied->kind = RegValue::NONE;
 		return true;
+	}
 
 	m_regWriteFailures++;
 	if(m_regWriteFailures <= 5)
@@ -505,7 +481,6 @@ bool OscillOscilloscope::WriteRegister(const string& name, const Bytes& request)
 	}
 	return false;
 }
-
 bool OscillOscilloscope::WriteReg1(const string& name, uint8_t value)
 {
 	return WriteRegister(name, BuildRegisterWrite1(name, value));
@@ -522,7 +497,12 @@ bool OscillOscilloscope::WriteReg4(const string& name, uint32_t value)
 }
 
 /**
-	@brief If a GET 'D' is outstanding, cancel it with GET 'C' and swallow whatever comes back
+	@brief Ends an outstanding GET 'D' before another request is sent.
+
+	Verified on hardware: a 'D' reply comes one record duration after the request (0.26 s at 1 kS/s, 5.1 s at
+	50 S/s), and while acquiring the probe does not process commands (GET 'C' sent during a 5 s record got no ACK and
+	desynchronised everything after it). Sending while it transmits makes it restart the reply. So the only safe way
+	to end a request is to wait for its reply; GET 'C' is a fallback if the reply never comes.
  */
 void OscillOscilloscope::CancelPendingAcquisition()
 {
@@ -530,28 +510,25 @@ void OscillOscilloscope::CancelPendingAcquisition()
 		return;
 	m_requestOutstanding = false;
 
-	//The hardware trigger never holds a GET 'D' back, so its reply is already on its way. Let it finish instead of
-	//sending GET 'C' into it: sending while the probe transmits makes it restart the reply, which desynchronised
-	//the stream on real hardware (seen as "a0 00 ba 72 a0 00 ba 72 00 04 44 ..." in ngscopeclient's log).
 	Bytes f;
-	double deadline = GetTime() + 2.0;
+	double deadline = m_requestTime + GetRecordSeconds() + CANCEL_MARGIN_S;
 	while(true)
 	{
-		int remaining = (int)((deadline - GetTime()) * 1e3);
-		if(remaining <= 0)
-			break;
+		int remaining = max(1, (int)((deadline - GetTime()) * 1e3));
 		if(!ReadFrame(f, remaining))
-			continue;
+			break;
 		if(IsCommandReply(f, CMD_DATA))
 			return;			//the reply we were waiting for: discard it
-		LogWarning("Oscill: unexpected frame while finishing a waveform request: %s\n", HexDump(f, 16).c_str());
+		LogWarning("Oscill: unexpected frame while ending a waveform request: %s\n", HexDump(f, 16).c_str());
 		Resync();
 		return;
 	}
 
-	//Nothing came back: cancel explicitly and expect the ACK (A0 00 03)
+	LogWarning("Oscill: waveform request not answered in time, cancelling\n");
 	if(!SendFrame(BuildCommand(CMD_CANCEL)))
 		return;
+
+	//Expect the ACK (A0 00 03). A record finished at the same moment may arrive first: skip it.
 	deadline = GetTime() + 1.0;
 	while(true)
 	{
@@ -594,7 +571,6 @@ bool OscillOscilloscope::EnsureConnected()
 		LogError("Oscill: probe still not answering, not arming\n");
 		return false;
 	}
-	m_currentRunMode = -1;
 	PushAll();
 	return true;
 }
@@ -604,23 +580,16 @@ bool OscillOscilloscope::EnsureConnected()
 
 void OscillOscilloscope::PushAll()
 {
+	//Neutral acquisition state (see RT_FREE_RUN). TC / TD don't change what the probe returns in free run, but
+	//zero is the harmless value for a pre-trigger count and a delay.
+	WriteReg1("RT", RT_FREE_RUN);
+	WriteReg1("M1", M1_SAMPLE);
+	WriteReg2("TC", 0);
+	WriteReg4("TD", 0);
+
 	PushCoupling();
 	PushVerticalRange();
 	PushTimebase();
-	PushTriggerLevel();
-	PushTriggerSlope();
-	PushTriggerDelay();
-	PushAutoTimeout();
-}
-
-/**
-	@brief Auto mode fires on its own after TA. Its power-up value (65280 ticks, ~15.6 s at 50 MHz) makes Auto
-	look dead, so set a short timeout.
- */
-void OscillOscilloscope::PushAutoTimeout()
-{
-	double tickS = TIMER_TICK_CLOCKS * m_mc * MC_UNIT_FS / FS_PER_SECOND;
-	WriteReg4("TA", (uint32_t)max(1.0, llround(AUTO_TIMEOUT_S / tickS) * 1.0));
 }
 
 void OscillOscilloscope::PushCoupling()
@@ -636,97 +605,72 @@ void OscillOscilloscope::PushCoupling()
 
 void OscillOscilloscope::PushVerticalRange()
 {
+	//The software trigger level is kept in volts, so nothing else depends on the range
 	WriteReg2("V1", (uint16_t)lround(g_voltsPerDiv[m_vrangeIndex] * 1000));
-
-	//Trigger level is stored in ADC codes so it moves with the range
-	PushTriggerLevel();
-}
-
-void OscillOscilloscope::PushTimebase()
-{
-	WriteReg4("TS", m_ts);
-
-	//Trigger position is stored in samples so it moves with the timebase
-	PushTriggerDelay();
-}
-
-void OscillOscilloscope::PushTriggerLevel()
-{
-	auto et = GetEdgeTrigger();
-	if(!et)
-		return;
-	//S1 = trigger level slider (ScrollTrigCH1), one byte on the ADC code scale
-	double code = g_adcZeroCode + et->GetLevel() / GetVoltsPerCode();
-	WriteReg1("S1", (uint8_t)lround(max(0.0, min(255.0, code))));
-}
-
-void OscillOscilloscope::PushTriggerSlope()
-{
-	auto et = GetEdgeTrigger();
-	if(!et)
-		return;
-
-	uint8_t t1 = m_t1 & ~T1_EDGE_MASK;
-	switch(et->GetType())
-	{
-		case EdgeTrigger::EDGE_RISING:
-			t1 |= T1_RISING;
-			break;
-		case EdgeTrigger::EDGE_FALLING:
-			t1 |= T1_FALLING;
-			break;
-		case EdgeTrigger::EDGE_ANY:
-			t1 |= T1_RISING | T1_FALLING;
-			break;
-		default:
-			LogWarning("Oscill: unsupported edge type, using rising\n");
-			et->SetType(EdgeTrigger::EDGE_RISING);
-			t1 |= T1_RISING;
-			break;
-	}
-	if(WriteReg1("T1", t1))
-		m_t1 = t1;
 }
 
 /**
-	@brief Pushes the horizontal trigger position.
-
-	Positive offsets (trigger inside the record) become TC = number of pre-trigger samples, limited to TCh and the
-	record length. Negative offsets (record starts after the trigger) become TD, a post-trigger delay in units of
-	12000 MCU clocks, with TC = 0.
+	@brief Writes TS and takes the value the probe applied (it rounds to whole clocks at fast rates), then refreshes
+	the clock and record length, which the time axis depends on.
  */
-void OscillOscilloscope::PushTriggerDelay()
+void OscillOscilloscope::PushTimebase()
 {
-	int64_t period = GetSamplePeriodFs();
-	uint32_t tc = 0;
-	uint32_t td = 0;
-	if(m_triggerOffset >= 0)
-	{
-		int64_t pre = m_triggerOffset / period;
-		int64_t maxPre = min<int64_t>(m_tcMax, (int64_t)m_lastDepth);
-		tc = (uint32_t)max<int64_t>(0, min(pre, maxPre));
-	}
-	else
-	{
-		double tickFs = TIMER_TICK_CLOCKS * m_mc * MC_UNIT_FS;
-		td = (uint32_t)llround(min(2147483647.0, -m_triggerOffset / tickFs));
-	}
-	WriteReg2("TC", (uint16_t)tc);
-	WriteReg4("TD", td);
+	RegValue applied;
+	if(WriteRegister("TS", BuildRegisterWrite4("TS", m_ts), &applied) && applied.IsNumeric() && applied.u > 0)
+		m_ts = applied.u;
+	ReadTimebaseState();
 }
 
-bool OscillOscilloscope::PushRunMode(uint8_t mode)
+/**
+	@brief Re-reads MC (it drifts by itself: 1991, 1982, 1993, 2000 seen) and QS (the record length)
+ */
+void OscillOscilloscope::ReadTimebaseState()
 {
-	if(m_currentRunMode == mode)
-		return true;
-	if(WriteReg1("RT", mode))
+	RegValue v;
+	if( (ReadRegister("MC", v) || ReadRegister("MCd", v)) && v.IsNumeric() && v.u > 0)
+		m_mc = v.u;
+	if(ReadRegister("QS", v) && v.IsNumeric() && v.u > JUNK_SAMPLES)
 	{
-		m_currentRunMode = mode;
-		return true;
+		m_qs = v.u;
+		m_lastDepth = m_qs - JUNK_SAMPLES;
 	}
-	//Don't retry on every poll if the probe doesn't accept it
-	m_currentRunMode = mode;
-	return false;
+}
+
+/**
+	@brief Duration of one record, in seconds: a GET 'D' reply arrives this long after the request
+ */
+double OscillOscilloscope::GetRecordSeconds()
+{
+	return (double)m_qs * GetSamplePeriodFs() / FS_PER_SECOND;
+}
+
+size_t OscillOscilloscope::NearestVoltRange(double voltsPerDiv)
+{
+	size_t best = 0;
+	for(size_t k=1; k<g_numVoltRanges; k++)
+	{
+		if(fabs(log(g_voltsPerDiv[k] / voltsPerDiv)) < fabs(log(g_voltsPerDiv[best] / voltsPerDiv)))
+			best = k;
+	}
+	return best;
+}
+
+/**
+	@brief The entry of the sample rate list closest to what TS really gives (within 2 %), else the real rate.
+	ngscopeclient shows the rate in a list, and the probe rounds TS, so exact matches are rare.
+ */
+uint64_t OscillOscilloscope::NominalRate(uint32_t ts)
+{
+	double actual = TSToRate(ts);
+	uint64_t best = 0;
+	for(auto r : GetSampleRatesNonInterleaved())
+	{
+		if( (best == 0) || (fabs(log(r / actual)) < fabs(log(best / actual))) )
+			best = r;
+	}
+	if( (best != 0) && (fabs(log(best / actual)) < 0.02) )
+		return best;
+	return (uint64_t)llround(actual);
 }
 
 double OscillOscilloscope::GetVoltsPerCode()
@@ -754,15 +698,9 @@ double OscillOscilloscope::TSToRate(uint32_t ts)
 uint32_t OscillOscilloscope::RateToTS(uint64_t rate)
 {
 	double ts = 256.0 * FS_PER_SECOND / ((double)rate * m_mc * MC_UNIT_FS);
-	ts = max((double)m_tsMin, min((double)m_tsMax, ts));
+	double tsMax = 256.0 * FS_PER_SECOND / ((double)MIN_SAMPLE_RATE * m_mc * MC_UNIT_FS);
+	ts = max((double)TS_MIN, min(tsMax, ts));
 	return (uint32_t)llround(ts);
-}
-
-EdgeTrigger* OscillOscilloscope::GetEdgeTrigger()
-{
-	if(!m_trigger)
-		PullTrigger();
-	return dynamic_cast<EdgeTrigger*>(m_trigger);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -818,9 +756,8 @@ void OscillOscilloscope::SetChannelAttenuation(size_t /*i*/, double atten)
 	if(atten <= 0)
 		return;
 
-	//Software only: keep the trigger at the same voltage
+	//Software only (scales the volt axis; the trigger level is in volts already)
 	m_attenuation = atten;
-	PushTriggerLevel();
 }
 
 vector<unsigned int> OscillOscilloscope::GetChannelBandwidthLimiters(size_t /*i*/)
@@ -922,7 +859,7 @@ float OscillOscilloscope::GetChannelOffset(size_t /*i*/, size_t /*stream*/)
 
 void OscillOscilloscope::SetChannelOffset(size_t /*i*/, size_t /*stream*/, float offset)
 {
-	//Display-only offset. The O1 DAC holds the factory zero calibration and is left untouched.
+	//Display-only: the probe has no offset control in use (the ADC always spans +-4 div around 0 V)
 	m_offset = offset;
 }
 
@@ -952,13 +889,10 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 	if(m_frameReady)
 		return TRIGGER_MODE_TRIGGERED;
 
-	//The probe always free-runs; triggering is done in software on each record (FindEdge)
-	uint8_t mode = RUN_FREE;
-
-	//Arm: issue GET 'D'. In Normal mode the probe holds the reply until it triggers.
+	//Ask for the next record. The probe free-runs (triggering is done in software on each record) and answers one
+	//record duration later.
 	if(!m_requestOutstanding)
 	{
-		PushRunMode(mode);
 		m_rxBuf.clear();
 		if(!SendFrame(BuildCommand(CMD_DATA)))
 			return TRIGGER_MODE_STOP;
@@ -969,8 +903,7 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 	Bytes f;
 	if(ReadFrame(f, POLL_TIMEOUT_MS))
 	{
-		//In Auto / Normal mode the probe answers at once with an empty body (49 00 03) while nothing has triggered:
-		//ask again on the next poll
+		//An empty body (49 00 03) means "no record"; seen in RT = 1. Ask again on the next poll.
 		WaveformFrame probe;
 		if(IsCommandReply(f, CMD_DATA) && !ParseWaveform(f, probe))
 		{
@@ -999,10 +932,11 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 		return TRIGGER_MODE_WAIT;
 	}
 
-	//Free-run and auto must produce data on their own; if not, something got lost
-	if( (mode != RUN_NORMAL) && (GetTime() - m_requestTime > FREERUN_WATCHDOG_S) )
+	//The reply is due one record duration after the request; if it is very late, something got lost
+	double limit = 2 * GetRecordSeconds() + WATCHDOG_MARGIN_S;
+	if(GetTime() - m_requestTime > limit)
 	{
-		LogWarning("Oscill: no waveform in %.1f s, re-arming\n", FREERUN_WATCHDOG_S);
+		LogWarning("Oscill: no waveform in %.1f s, re-arming\n", limit);
 		CancelPendingAcquisition();
 	}
 
@@ -1177,7 +1111,7 @@ void OscillOscilloscope::PullTrigger()
 {
 	lock_guard<recursive_mutex> lock(m_mutex);
 
-	//Trigger registers are write-only as far as we know, so the cached trigger object is the source of truth
+	//The trigger exists only in software: the trigger object is the source of truth
 	if(m_trigger && !dynamic_cast<EdgeTrigger*>(m_trigger))
 	{
 		delete m_trigger;
@@ -1219,9 +1153,8 @@ void OscillOscilloscope::PushTrigger()
 		LogWarning("Oscill: only edge triggers are supported\n");
 		return;
 	}
+	//The hardware trigger registers have no effect on fw 1.26: the software trigger uses these cached values
 	CacheTriggerSettings();
-	PushTriggerLevel();
-	PushTriggerSlope();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1229,17 +1162,16 @@ void OscillOscilloscope::PushTrigger()
 
 vector<uint64_t> OscillOscilloscope::GetSampleRatesNonInterleaved()
 {
-	//1-2-5 steps within what [TMl, TMh] allows, plus the maximum rate itself
+	//1-2-5 steps from MIN_SAMPLE_RATE up to the fastest tested rate (TS_MIN), plus that maximum itself
 	vector<uint64_t> ret;
-	double maxRate = TSToRate(m_tsMin);
-	double minRate = TSToRate(m_tsMax);
+	double maxRate = TSToRate(TS_MIN);
 	static const int steps[] = {1, 2, 5};
 	for(double decade = 1; decade < 1e10; decade *= 10)
 	{
 		for(int st : steps)
 		{
 			double r = st * decade;
-			if(r >= minRate && r < maxRate * 0.999)
+			if(r >= MIN_SAMPLE_RATE && r < maxRate * 0.98)
 				ret.push_back((uint64_t)r);
 		}
 	}
@@ -1279,7 +1211,7 @@ uint64_t OscillOscilloscope::GetSampleDepth()
 
 void OscillOscilloscope::SetSampleDepth(uint64_t /*depth*/)
 {
-	//Fixed record length
+	//Not settable from here: the record length is whatever QS is (see docs/Driver.md)
 }
 
 void OscillOscilloscope::SetSampleRate(uint64_t rate)
@@ -1287,17 +1219,17 @@ void OscillOscilloscope::SetSampleRate(uint64_t rate)
 	lock_guard<recursive_mutex> lock(m_mutex);
 	if(rate == 0)
 		return;
-	m_sampleRate = rate;
 	m_ts = RateToTS(rate);
-	LogDebug("Oscill: %llu S/s -> TS %u (actual %.6g S/s)\n", (unsigned long long)rate, m_ts, TSToRate(m_ts));
 	PushTimebase();
+	m_sampleRate = NominalRate(m_ts);
+	LogDebug("Oscill: %llu S/s requested -> TS %u (actual %.6g S/s)\n",
+		(unsigned long long)rate, m_ts, TSToRate(m_ts));
 }
 
 void OscillOscilloscope::SetTriggerOffset(int64_t offset)
 {
 	lock_guard<recursive_mutex> lock(m_mutex);
-	m_triggerOffset = offset;
-	PushTriggerDelay();
+	m_triggerOffset = offset;		//used by the software trigger only
 }
 
 int64_t OscillOscilloscope::GetTriggerOffset()

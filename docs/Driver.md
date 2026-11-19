@@ -42,17 +42,25 @@ relies on are in [Protocol.md](Protocol.md); this document covers how the driver
    * on failure, send "back to 9600" **at the new rate** before switching the host back, so the two sides can't end
      up mismatched.
 4. Send GET `C` (required for live data).
-5. Read identity (`VNM`, `VSN`, `VHW`, `VSW`, 4 ASCII chars each) and limits (`MCl`, `MCh`, `MCd`, `TCh`), plus the
-   current `MC`, `QS`, `TS`, `O1` and `T1`.
-6. Centre the trigger position in the record, create the edge trigger object, and push the full configuration
-   (`PushAll()`).
+5. Read identity (`VNM`, `VSN`, `VHW`, `VSW`, 4 ASCII chars each) and log the limits (`MCl`, `MCh`, `MCd`, `TMl`,
+   `TMh`, `TCh`, `QSh`).
+6. **Start from the probe's state**: `V1` → volts/div, `O1` → coupling and filters, `TS` → sample rate, plus `MC`
+   and `QS`.
+7. Centre the trigger position in the record, create the edge trigger object, and push the configuration
+   (`PushAll()`): a neutral acquisition state (`RT` = 0 free run, `M1` = 0 plain sampling, `TC` = 0, `TD` = 0;
+   the vendor app may leave Average / Peak or a delay set), then `O1`, `V1` and `TS`.
 
 `IDPing()` reads `VNM`, `VSN` and `VSW` fresh (GET `F` is rejected by the firmware). On disconnect the destructor
 cancels any pending request and switches the probe back to 9600, as the vendor app does.
 
 Register access: 3-letter names use the `p` read, 2-letter names the name-only `q` query; writes use `q` with a
-`B1`/`F0`/`F1` value by register width. A write counts as successful on any `A0` reply. If the probe rejects writes,
-the driver logs the first five failures and keeps capturing with the probe's own settings.
+`B1`/`F0`/`F1` value by register width. A write counts as successful on any `A0` reply, which echoes the value the
+probe applied: for `TS` the driver uses that echo (the probe rounds fast rates to whole clocks), then re-reads `MC`
+(it drifts) and `QS`. If the probe rejects writes, the driver logs the first five failures and keeps capturing with
+the probe's own settings.
+
+The hardware trigger registers (`S1`, `T1`, `TC`, `TD`, `TA`, `TW`) are not written after connect: they have no
+effect on firmware 1.26, and every write costs a round trip that has to wait for the current record.
 
 ## Acquisition
 
@@ -68,16 +76,18 @@ ngscopeclient's instrument thread calls `PollTrigger()` in a loop while armed:
 3. Empty record (`49 00 03`): clear the request and ask again next poll.
 4. Full record: run the software trigger. In Normal / Single mode a record without the selected edge is dropped and
    the next poll asks again. Otherwise the frame is kept and `TRIGGER_MODE_TRIGGERED` returned.
-5. Watchdog: no reply within 5 s → cancel with `C` and re-arm.
+5. Watchdog: no reply within 2 × record duration + 5 s → cancel and re-arm. (The reply normally comes one record
+   duration after the request: 2.5 s at the slowest offered rate.)
 
 `AcquireData()` then converts the record: drops the first 2 (garbage) samples, scales codes to volts, sets the sample
-period and the trigger phase, and queues the waveform. Records are `QS` − 2 samples (252 with the power-up `QS` of 254; `QS` has also been seen at 172).
+period and the trigger phase, and queues the waveform. Records are `QS` − 2 samples (252 with the power-up `QS`).
 
-Any configuration change first finishes an outstanding `D` (`CancelPendingAcquisition()`): since the probe never holds
-a `D` back, its reply is already on its way, so the driver reads it to the end and discards it. Only if nothing
-arrives within 2 s does it send `C`. (Sending while the probe is transmitting makes it restart the reply and
-desynchronises the stream.) Then it writes the register and lets the next poll re-arm. A waveform captured with old
-settings is discarded. Any frame that doesn't parse triggers `Resync()`: drop the buffer and flush the input.
+Any configuration change (and Stop) first ends an outstanding `D` (`CancelPendingAcquisition()`). The probe neither
+accepts commands while acquiring nor tolerates them while transmitting, so the driver **waits for the reply**, until
+its expected time (request time + record duration + 1 s), and discards it. Only if it never comes is `C` sent. Then
+it writes the register and lets the next poll re-arm. At slow rates a setting change can therefore take up to one
+record (2.5 s at 100 S/s), which is why slower rates aren't offered. A waveform captured with old settings is
+discarded. Any frame that doesn't parse triggers `Resync()`: drop the buffer and flush the input.
 
 All methods that touch the port hold the oscilloscope's `m_mutex`; ngscopeclient calls them from both its GUI and its
 instrument thread.
@@ -105,11 +115,6 @@ instrument thread.
 At 921600 baud a record arrives every ~0.04 s, so the driver checks ~25 records per second for an edge. Rare events
 between records are missed (the probe's dead time between records is unknown).
 
-### Timeouts written at connect
-
-`TA` (Auto timeout) is set to 100 ms. Its power-up value (~15.6 s) made Auto mode look dead in an earlier version.
-`TC` / `TD` / `T1` / `S1` are still written from the trigger settings (harmless; the probe reports them in metadata).
-
 ## Mapping to ngscopeclient controls
 
 | ngscopeclient | Driver | Registers |
@@ -120,14 +125,15 @@ between records are missed (the probe's dead time between records is unknown).
 | ADC mode | "Full bandwidth", "Low-pass ~3 MHz (Filt L)", "High-pass ~3 kHz (Filt H)", "Band-pass (Filt L + Filt H)" | `O1` bits 2–3 |
 | Bandwidth limit | none / 3 MHz: switches the low-pass only (the API takes whole MHz) | `O1` bit 2 |
 | Probe attenuation | software multiplier on the volt scale | — |
-| Sample rate | 1-2-5 steps from ~1 S/s up to one sample per MCU clock (~50 MHz), plus that maximum | `TS` = round(256 × Tsample / Tclock) |
-| Sample depth | not settable: whatever `QS` delivers, minus 2 garbage samples (read at connect) | — |
+| Sample rate | 1-2-5 steps from 100 S/s to the fastest tested rate (`TS` = 512, ~25 MS/s), plus that maximum; shown as the list entry nearest the rate the probe applied | `TS` = round(256 × Tsample / Tclock) |
+| Sample depth | not settable: whatever `QS` delivers, minus 2 garbage samples (re-read after rate changes) | — |
 | Trigger | edge: rising / falling / either, level; position = trigger offset | software (see above) |
 | Run / Single / Stop / Force / Auto | as in the table above | `RT` = 0 always |
 
 Values not exposed: `M1` acquisition modes (Average / HiRes / Peak), `QS`, RIS, `TD` delay mode.
 
-Scaling uses the probe's own `MC`, read at connect (it drifts by itself; see Protocol.md):
+Scaling uses the probe's own `MC`, read at connect and after every rate change (it drifts by itself; see
+Protocol.md):
 
 ```
 volts         = (code − 128) × V1/1000 × 8/256
@@ -182,8 +188,9 @@ the edge finder. Needs no libscopehal or hardware.
 
 `tools/oscill_sim.py --link /tmp/ttyOSC` creates a pseudo-terminal that answers like a fw 1.26 probe (`q` reads,
 `F` rejected, 4-char identity registers, register widths). Options: `--reject-writes`, `--silent` (dead probe),
-`--boot` (stuck in bootloader). It produces a moving sine, not the real probe's quirks (no stale buffer before `C`,
-no garbage samples).
+`--boot` (stuck in bootloader). Like the real probe it answers `D` one record duration later, sends 4 metadata bytes
+and `QS` samples (the first two garbage) and echoes applied values (rounding fast `TS` to whole clocks). It doesn't
+reproduce the stale buffer before `C` or the probe ignoring commands while acquiring.
 
 ### Smoke test (`-DOSCILL_BUILD_SMOKE_TEST=ON`)
 
@@ -201,6 +208,10 @@ build/smoke_test /dev/ttyUSB1:921600 3 filters    # spike height/width per ADC m
 
 ```bash
 build/smoke_test /dev/ttyUSB1:921600 3 stress     # 30 s: acquisition thread vs a GUI-like settings thread
+```
+
+```bash
+build/smoke_test /dev/ttyUSB1:921600 3 slow       # 100 S/s: capture arrives, Stop mid-record keeps the link in sync
 ```
 
 The stress mode replaces and deletes trigger objects, moves the level, and changes range and sample rate every
@@ -228,6 +239,8 @@ Commands: `id`, `read REG…` (picks `p` or `q` by name length), `write REG auto
 ## Known limitations
 
 * The hardware trigger isn't used (it doesn't work on fw 1.26); events that fall between records are missed.
-* Sample rates above a few MS/s and the ~3 MHz low-pass are untested on hardware; RIS is not supported.
+* Sample rates: 100 S/s to ~25 MS/s. Slower rates would block settings changes for a whole record (the probe ignores
+  commands while acquiring); one sample per clock (~50 MS/s) and RIS are untested / unsupported.
+* The ~3 MHz low-pass is unconfirmed on hardware.
 * `M1` acquisition modes, `QS` record length, `TD` delay mode and the probe's "Memo" / ROLL features aren't exposed.
 * Single channel, no external trigger.

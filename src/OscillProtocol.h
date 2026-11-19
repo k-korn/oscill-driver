@@ -57,22 +57,25 @@ enum TypeMarker : uint8_t
 //Core commands carried in the 'r' header
 enum Command : char
 {
-	CMD_DATA		= 'D',		//fetch a waveform (blocks until trigger in Normal/Wait mode)
-	CMD_FIRMWARE	= 'F',		//firmware / ID string
-	CMD_CANCEL		= 'C'		//cancel a pending 'D'
+	CMD_DATA		= 'D',		//fetch a waveform; the reply comes when a fresh record has been acquired
+	CMD_FIRMWARE	= 'F',		//firmware / ID string (rejected by the oscilloscope firmware 1.26)
+	CMD_CANCEL		= 'C'		//cancel / reset acquisition
 };
+
+//OBEX End-of-Body header: carries the waveform data
+static const uint8_t HDR_END_OF_BODY = 0x49;
 
 ///@brief Smallest legal frame (opcode + 16-bit length)
 static const size_t FRAME_HEADER_LEN = 3;
 
-///@brief Upper bound on frame size we accept. The probe negotiates 0x0018 / 0x1000 in CONNECT; 4 kB is plenty.
+///@brief Upper bound on frame size we accept. Records go up to QSh (1788 seen) samples; 4 kB is plenty.
 static const size_t FRAME_MAX_LEN = 4096;
 
-///@brief Nominal number of ADC samples in one 'D' reply
-static const size_t NOMINAL_SAMPLE_COUNT = 344;
+///@brief Record length (QS) at power-up
+static const size_t DEFAULT_RECORD_LEN = 254;
 
-///@brief Number of metadata bytes between the 'r'/'D' header and the samples
-static const size_t WAVEFORM_METADATA_LEN = 7;
+///@brief Metadata bytes at the start of the End-of-Body data, before the samples
+static const size_t WAVEFORM_METADATA_LEN = 4;
 
 ///@brief A value read from / written to a register
 struct RegValue

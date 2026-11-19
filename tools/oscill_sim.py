@@ -24,8 +24,10 @@ import tty
 # Identity registers: 4 ASCII characters packed in an F1 value (as a real fw 1.26 probe answers)
 STRING_REGS = {"VNM": "Uosc", "VSN": "3404", "VHW": "1.25", "VSW": "1.26"}
 # MC* are in 10 ps units; TS = clocks per sample * 256, limited to [TMl, TMh]; V1 = mV/div
-NUM_REGS = {"MCl": 800, "MCh": 5425, "MCd": 1248, "MC": 1250, "TMl": 256, "TMh": 256 * 65536, "TOv": 1000,
-            "O1": 0x02, "M1": 0, "T1": 0x20, "S1": 128, "TCh": 2000, "V1": 1000, "RT": 0, "TA": 128, "TC": 0, "TD": 172, "TS": 20480}
+# Power-up values of a real fw 1.26 probe (MC drifts on real hardware; fixed here)
+NUM_REGS = {"MCl": 800, "MCh": 5425, "MCd": 1248, "MC": 1991, "TMl": 25, "TMh": 256, "TCh": 252, "QSh": 254,
+            "O1": 0, "M1": 0, "T1": 0x30, "S1": 127, "V1": 10000, "RT": 0, "TA": 65280, "TW": 65280,
+            "TC": 0, "TD": 0, "TS": 512, "QS": 254, "AP": 0, "AR": 1, "RS": 0}
 
 
 # Register widths recovered from oscill.exe (which of PutGetOne/Two/FourbyteRegister each name is passed to)
@@ -52,13 +54,27 @@ class Probe:
             print("TX", data[:24].hex(" "), "..." if len(data) > 24 else "", flush=True)
         os.write(self.fd, data)
 
+    def record_seconds(self):
+        # a real probe answers GET 'D' only after acquiring a fresh record: QS samples of TS/256 clocks each
+        return self.regs["QS"] * self.regs["TS"] / 256 * self.regs["MC"] * 1e-11
+
     def waveform(self):
-        n = 344
+        # real layout: 'r' echo, End-of-Body header, 4 metadata bytes, QS samples, the first two of them garbage
+        n = self.regs["QS"]
         self.phase += 0.3
-        samples = bytes(
-            max(0, min(255, int(128 + 100 * math.sin(2 * math.pi * 3 * i / n + self.phase)))) for i in range(n))
-        meta = bytes([self.regs["TS"] & 0xff, 0, 0, 0, 0, 172 >> 8 & 0xff, 172 & 0xff])
-        return frame(0xA0, b"\x72\x00\x04D" + meta + samples)
+        samples = bytes([250, 66]) + bytes(
+            max(0, min(255, int(128 + 100 * math.sin(2 * math.pi * 3 * i / n + self.phase)))) for i in range(2, n))
+        body = bytes([self.regs["T1"] & 0x30, 0, 0, 0]) + samples
+        return frame(0xA0, b"\x72\x00\x04D" + b"\x49" + struct.pack(">H", 3 + len(body)) + body)
+
+    def value_header(self, name, default_width=4):
+        w = REG_WIDTH.get(name, default_width)
+        v = self.regs[name]
+        if w == 1:
+            return bytes([0xB1, v & 0xff])
+        if w == 2:
+            return b"\xF0" + struct.pack(">I", v & 0xffff)
+        return b"\xF1" + struct.pack(">I", v & 0xffffffff)
 
     def handle(self, pkt):
         if self.log:
@@ -85,8 +101,7 @@ class Probe:
                 self.pending_d_at = None
                 self.send(bytes.fromhex("A0 00 03"))
             elif cmd == "D":
-                delay = self.args.trigger_delay if self.regs["RT"] == 2 else 0.0
-                self.pending_d_at = time.time() + delay
+                self.pending_d_at = time.time() + self.record_seconds()
             else:
                 self.send(frame(0xD0))
             return
@@ -101,6 +116,10 @@ class Probe:
             name = pkt[6:3 + hl].decode(errors="replace")
             vh = pkt[3 + hl:]
             width = REG_WIDTH.get(name)
+            if name in self.regs and not vh:
+                # name-only 'q': read a settings register; reply = echoed name header + value header
+                self.send(frame(0xA0, pkt[3:3 + hl] + self.value_header(name)))
+                return
             if name in self.regs and vh:
                 marker, val = vh[0], vh[1:]
                 if marker == 0xB1 and len(val) == 1 and width == 1:
@@ -113,8 +132,10 @@ class Probe:
                     print(f"bad write to {name}: {vh.hex(' ')} (register is {width} bytes)", flush=True)
                     self.send(frame(0xD0))
                     return
+                if name == "TS" and self.regs["TS"] < 65536:
+                    self.regs["TS"] -= self.regs["TS"] % 256     # real probe: whole clocks at fast rates
                 print(f"set {name} = {self.regs[name]}", flush=True)
-                self.send(frame(0xA0))
+                self.send(frame(0xA0, pkt[3:3 + hl] + self.value_header(name)))   # echo of the applied value
                 return
             self.send(frame(0xD0))
             return
@@ -129,13 +150,10 @@ class Probe:
                 self.send(frame(0xA0, b"\x70" + struct.pack(">H", 3 + len(hdr_body)) + hdr_body +
                                 b"\xF1" + STRING_REGS[name].encode()[:4]))
                 return
-            elif name in self.regs:
+            elif name in self.regs and len(name) >= 3:
                 # value header follows the echoed name header, like a real probe (MCl: F0 00 00 03 20)
-                w = REG_WIDTH.get(name, 4)
-                value = {1: bytes([0xB1, self.regs[name] & 0xff]),
-                         2: b"\xF0" + struct.pack(">I", self.regs[name] & 0xffff)}.get(
-                    w, b"\xF1" + struct.pack(">I", self.regs[name] & 0xffffffff))
-                self.send(frame(0xA0, b"\x70" + struct.pack(">H", 3 + len(hdr_body)) + hdr_body + value))
+                self.send(frame(0xA0, b"\x70" + struct.pack(">H", 3 + len(hdr_body)) + hdr_body +
+                                self.value_header(name, 2)))
                 return
             else:
                 self.send(frame(0xD0))
@@ -168,7 +186,6 @@ class Probe:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--trigger-delay", type=float, default=0.2, help="seconds to hold 'D' in Normal mode")
     ap.add_argument("--link", help="also create a symlink to the pty at this path")
     ap.add_argument("--reject-writes", action="store_true", help="answer every register PUT with 0xD0 (error)")
     ap.add_argument("--boot", action="store_true", help="behave like a probe stuck in its bootloader")

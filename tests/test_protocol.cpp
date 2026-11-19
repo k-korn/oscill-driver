@@ -54,19 +54,28 @@ int main()
 		CHECK(!IsPlausibleOpcode(0x44));
 	}
 
-	//358 byte waveform reply
+	//Long record (QS can go up to QSh = 1788 at <= 1 MS/s): End-of-Body length is 16 bits
 	{
-		Bytes r{0xA0, 0x01, 0x66, 0x72, 0x00, 0x04, 0x44};
-		for(int i=0; i<7; i++)
-			r.push_back(0xE0 + i);
-		for(int i=0; i<344; i++)
+		const size_t n = 1788;
+		Bytes r{0xA0, 0x00, 0x00, 0x72, 0x00, 0x04, 0x44, 0x49, 0x00, 0x00, 0xE0, 0xE1, 0xE2, 0xE3};
+		for(size_t i=0; i<n; i++)
 			r.push_back(i & 0xff);
-		CHECK(r.size() == 358);
-		CHECK(FrameLength(r.data()) == 358);
+		r[1] = r.size() >> 8;	r[2] = r.size() & 0xff;
+		size_t blen = r.size() - 7;
+		r[8] = blen >> 8;		r[9] = blen & 0xff;
+		CHECK(FrameLength(r.data()) == r.size());
 		WaveformFrame wf;
 		CHECK(ParseWaveform(r, wf));
-		CHECK(wf.metadata.size() == 7 && wf.metadata[0] == 0xE0);
-		CHECK(wf.samples.size() == 344 && wf.samples[0] == 0 && wf.samples[343] == (343 & 0xff));
+		CHECK(wf.metadata.size() == 4 && wf.metadata[0] == 0xE0 && wf.metadata[3] == 0xE3);
+		CHECK(wf.samples.size() == n && wf.samples[0] == 0 && wf.samples[n-1] == ((n-1) & 0xff));
+
+		//Inconsistent End-of-Body length or a missing 49 header are rejected
+		Bytes bad = r;
+		bad[9]--;
+		CHECK(!ParseWaveform(bad, wf));
+		bad = r;
+		bad[7] = 0x48;
+		CHECK(!ParseWaveform(bad, wf));
 		CHECK(!ParseWaveform(Bytes{0xA0, 0x00, 0x03}, wf));
 	}
 
@@ -161,7 +170,7 @@ int main()
 		WaveformFrame wf;
 		CHECK(ParseWaveform(d, wf));
 		CHECK(wf.samples.size() == 254);
-		CHECK(wf.metadata.size() == 7 && wf.metadata[3] == 0x20);
+		CHECK(wf.metadata.size() == 4 && wf.metadata[0] == 0x20);
 
 		Bytes empty{0xa0, 0x00, 0x0a, 0x72, 0x00, 0x04, 0x44, 0x49, 0x00, 0x03};
 		CHECK(IsCommandReply(empty, 'D'));

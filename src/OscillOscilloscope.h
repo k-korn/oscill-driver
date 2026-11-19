@@ -95,12 +95,14 @@ protected:
 	bool ReadFrame(oscill::Bytes& frame, int firstByteTimeoutMs, int bodyTimeoutMs = 3000);
 	bool Transact(const oscill::Bytes& request, oscill::Bytes& reply, int timeoutMs = 1500);
 	bool ReadRegister(const std::string& name, oscill::RegValue& value);
-	bool WriteRegister(const std::string& name, const oscill::Bytes& request);
+	bool WriteRegister(const std::string& name, const oscill::Bytes& request, oscill::RegValue* applied = nullptr);
 	bool WriteReg1(const std::string& name, uint8_t value);
 	bool WriteReg2(const std::string& name, uint16_t value);
 	bool WriteReg4(const std::string& name, uint32_t value);
 	bool ChangeBaudRate(unsigned int baud);
 	void CancelPendingAcquisition();
+
+	void Resync();
 
 	//Pushing cached configuration to hardware
 	void PushAll();
@@ -108,21 +110,20 @@ protected:
 	void PushFilter(size_t mode);
 	void PushVerticalRange();
 	void PushTimebase();
-	void PushTriggerLevel();
-	void PushTriggerSlope();
-	void PushTriggerDelay();
-	void PushAutoTimeout();
+	void ReadTimebaseState();
+
+	//Software trigger
 	bool ApplySoftwareTrigger(const oscill::WaveformFrame& wf);
 	void CacheTriggerSettings();
-	void Resync();
-	bool PushRunMode(uint8_t mode);
 
 	//Scaling helpers
 	double GetVoltsPerCode();
 	int64_t GetSamplePeriodFs();
+	double GetRecordSeconds();
 	double TSToRate(uint32_t ts);
 	uint32_t RateToTS(uint64_t rate);
-	EdgeTrigger* GetEdgeTrigger();
+	uint64_t NominalRate(uint32_t ts);
+	size_t NearestVoltRange(double voltsPerDiv);
 
 	OscillSerial m_port;
 	bool m_connected;
@@ -136,7 +137,6 @@ protected:
 	oscill::Bytes m_rxBuf;
 	oscill::Bytes m_frame;
 	double m_requestTime;
-	int m_currentRunMode;
 
 	//Cached configuration
 	bool m_channelEnabled;
@@ -144,19 +144,16 @@ protected:
 	double m_attenuation;
 	float m_offset;
 	size_t m_vrangeIndex;
-	uint32_t m_mc;			//MCU clock period, 10 ps units
-	uint32_t m_tsMin;		//TMl
-	uint32_t m_tsMax;		//TMh
-	uint32_t m_ts;			//current TS (clocks per sample * 256)
-	uint64_t m_sampleRate;	//nominal rate requested by the user
-	uint32_t m_tcMax;		//TCh, maximum pre-trigger samples
-	uint8_t m_o1;			//input option bits
-	uint8_t m_t1;			//trigger configuration bits
-	int64_t m_triggerOffset;
-	int64_t m_swTriggerPhase;
+	uint32_t m_mc;				//MCU clock period, 10 ps units (re-read: it drifts)
+	uint32_t m_ts;				//TS as applied by the probe (clocks per sample x 256)
+	uint32_t m_qs;				//QS: samples per record, including the 2 garbage ones
+	uint64_t m_sampleRate;		//rate shown to ngscopeclient (nearest list entry to the real one)
+	uint8_t m_o1;				//input option bits (coupling, filters)
+	int64_t m_triggerOffset;	//femtoseconds from record start to the trigger point
+	int64_t m_swTriggerPhase;	//time shift putting the software trigger crossing at m_triggerOffset
 	double m_swTrigLevel;		//trigger level in volts, copied from m_trigger under m_mutex
-	int m_swTrigEdges;			//EDGE_RISING_BIT / EDGE_FALLING_BIT, copied from m_trigger under m_mutex	//time shift putting the software trigger crossing at m_triggerOffset
-	uint64_t m_lastDepth;
+	int m_swTrigEdges;			//EDGE_RISING_BIT / EDGE_FALLING_BIT, copied from m_trigger under m_mutex
+	uint64_t m_lastDepth;		//samples per delivered waveform (m_qs minus the garbage)
 
 	//Diagnostics: if the probe rejects register writes we stop spamming the log
 	unsigned int m_regWriteFailures;

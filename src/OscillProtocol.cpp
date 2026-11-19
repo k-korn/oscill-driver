@@ -167,23 +167,29 @@ bool IsCommandReply(const Bytes& frame, char cmd)
 // Frame decoding
 
 /**
-	@brief Decodes a 'D' reply: A0 LL LL 72 00 04 44 <7 bytes metadata> <N samples>
+	@brief Decodes a 'D' reply (verified on hardware, fw 1.26):
+		A0 LL LL | 72 00 04 44 | 49 HH HH | <4 bytes metadata> <QS samples>
+	Returns false for anything else, including the empty reply A0 00 0A 72 00 04 44 49 00 03.
  */
 bool ParseWaveform(const Bytes& frame, WaveformFrame& out)
 {
 	if(!IsCommandReply(frame, CMD_DATA))
 		return false;
 
-	//Skip the 'r' header using its own length field rather than assuming 4
+	//Skip the 'r' header using its own length field
 	size_t hlen = ((size_t)frame[4] << 8) | frame[5];
 	size_t pos = 3 + hlen;
-	if(hlen < 4 || pos > frame.size())
+	if(hlen < 4 || pos + 3 > frame.size())
 		return false;
 
-	size_t remaining = frame.size() - pos;
-	if(remaining <= WAVEFORM_METADATA_LEN)
+	//End-of-Body header, whose length must cover exactly the rest of the frame
+	size_t blen = ((size_t)frame[pos+1] << 8) | frame[pos+2];
+	if(frame[pos] != HDR_END_OF_BODY || pos + blen != frame.size())
 		return false;
+	pos += 3;
 
+	if(frame.size() - pos <= WAVEFORM_METADATA_LEN)
+		return false;
 	out.metadata.assign(frame.begin() + pos, frame.begin() + pos + WAVEFORM_METADATA_LEN);
 	out.samples.assign(frame.begin() + pos + WAVEFORM_METADATA_LEN, frame.end());
 	return true;

@@ -140,6 +140,11 @@ reply      echoed 'D'    End-of-   metadata      8-bit unsigned
 * **Empty record**: `a0 00 0a 72 00 04 44 49 00 03`, i.e. a body with no data. Seen in `RT` = 1 shortly after
   arming, at fast `TS` with a floating input; it means "nothing yet, ask again". [HW]
 * Transfer time per record: ~0.33 s at 9600 baud, ~0.04 s at 921600. [HW]
+* **The reply comes when a fresh record has been acquired**, i.e. one record duration (`QS` × sample period) after
+  the request, plus the transfer: 0.04 s at 6.4 kS/s, 0.26 s at 1 kS/s, 1.28 s at 200 S/s, 5.1 s at 50 S/s. [HW]
+* **While acquiring, the probe does not process commands.** A GET `C` sent during a 5 s record got no ACK, and the
+  requests after it went unanswered or came back mixed up. The only safe way to end an outstanding `D` is to wait
+  for its reply. Likewise, never send while a reply is being transmitted: the probe restarts the reply. [HW]
 
 ## Registers
 
@@ -189,7 +194,7 @@ the probe's replies [HW].
 | `MCd` | 2 | default `MC` | 1248 [HW] |
 | `TMl`, `TMh` | 2 | unknown. **Not `TS` limits** (the probe accepts `TS` far above `TMh`) | 25, 256 [HW] |
 | `TCh` | 2 | maximum `TC` | 252 [HW] |
-| `QSh` | 2 | maximum `QS` (record length); **not constant** | 254 at power-up; 1788 later, with `TS` = 206119 [HW] |
+| `QSh` | 2 | maximum `QS` (record length); **depends on the sample rate** | 254 at `TS` = 512 (25 MS/s), 1788 at ≤ 1 MS/s [HW] |
 | `TOv`, `TOl`, `TPl`, `Fbw` | | read by the vendor app; meaning unknown [RE] | |
 | `P1h`, `P1l` | | listed by the vendor app; rejected by fw 1.26 [HW] | |
 
@@ -200,7 +205,7 @@ the probe's replies [HW].
 | `V1` | 2 | vertical scale in **mV/div** | [HW] battery test | 10000 |
 | `TS` | 4 | sample period in MCU clocks × 256 | [HW] 50 Hz test | 512 |
 | `MC` | 2 | MCU clock period, **10 ps units** | [HW] | 1991 |
-| `QS` | 2 | record length in samples | [RE `0x4c0f38`], matches record size [HW]; changed to 172 without the driver writing it | 254 |
+| `QS` | 2 | record length in samples; doesn't change with `TS` (the 172 once seen was left by the vendor app) | [RE `0x4c0f38`], matches record size [HW] | 254 |
 | `O1` | 1 | input options (bit map, below) | [HW] | 0 |
 | `M1` | 1 | acquisition mode: Sample / Average / HiRes / Peak | [RE `0x4b5fc0`] | 0 |
 | `RT` | 1 | run / trigger mode | see [Trigger](#trigger) | 0 |
@@ -246,6 +251,9 @@ sample period = TS / 256 × MC × 10 ps
 Confirmed with 50 Hz mains: `TS` = 2030000, `MC` = 1982 → 157.2 µs/sample, and the hum repeated every 126 samples
 (50.5 Hz). `TS` is a fixed-point clock divider: 256 = one sample per clock.
 
+**At fast rates the probe uses whole clocks**: writing `TS` = 514 applies 512, 12845 applies 12800; 128450 and above
+were applied unchanged. Use the value echoed by the write. [HW]
+
 `MC` (the clock period) **drifts by itself**: 1991 at power-up, 1982 after writing 1991, later 1993, 2000. Read it
 before converting. The vendor app retunes `MC` so the sample period comes out exact:
 `MC = round(Tsample × 1e11 × 256 / TS)` [RE `0x4c0e8a`]. Its `TS` choice is
@@ -275,7 +283,7 @@ TX  91 00 04 <1843200 / baud>          9600 → c0, 115200 → 10, 921600 → 02
 **On firmware 1.26 the hardware trigger does not gate or align captures.** [HW] Tested over 9600 and 921600 with
 50 Hz mains pickup and a clean spiky 50 Hz signal:
 
-* In `RT` = 0, 1, 2 and 3 alike, GET `D` returns a record immediately (one transfer time), even with the level
+* In `RT` = 0, 1, 2 and 3 alike, GET `D` returns the next record as soon as it's acquired, even with the level
   (`S1`) set where the signal never reaches, and with `TA`/`TW` at 65280 or 300.
 * Signal features drift by a constant amount from one record to the next (e.g. spikes every 127 samples moving
   ~26 samples per capture), exactly as in free run, independent of `TC` (50 / 100 / 200), `S1` and the edge bits.
@@ -298,8 +306,7 @@ Practical conclusion: run the probe in free run and trigger in software (see [Dr
 * How the hardware trigger is meant to work, if at all, on this firmware; the `RT` value mapping.
 * Metadata bytes 1–3; full meaning of byte 0.
 * `TMl`, `TMh`, `TOv`, `TOl`, `TPl`, `Fbw`, `AP`, `AR`, `RS`, `D1m`, `G1`, `G2`, `Gs`, `Lt`, `L1`, `L2`.
-* What sets `QS` and `QSh`: both changed (254/254 → 172/1788) while the driver never wrote `QS`. Either the probe
-  adjusts them with `TS`, or other software changed them. Writing `QS` hasn't been tested.
+* Writing `QS` (longer records, up to `QSh`) hasn't been tested.
 * `M1` acquisition modes (Average / HiRes / Peak): not tested.
 * Exact filter cut-offs; the 3 MHz low-pass is unconfirmed.
 * RIS (equivalent-time sampling below one clock per sample; `TS` < 256), ROLL mode.
