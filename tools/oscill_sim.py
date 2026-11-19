@@ -5,7 +5,7 @@ Oscill DSO1 probe simulator on a pseudo-terminal, for testing the ngscopeclient 
     python3 tools/oscill_sim.py            # prints the pty path, e.g. /dev/pts/5
     ngscopeclient  ->  driver "oscill", transport "uart", path "/dev/pts/5:9600"
 
-Implements the frames documented in docs/oscill-proto.md: CONNECT, GET 'D' / 'F' / 'C', register PUT 'q' and
+Implements the frames documented in docs/Protocol.md: CONNECT, GET 'D' / 'F' / 'C', register PUT 'q' and
 GET 'p'. In Normal trigger mode (RT=2) it holds the 'D' reply for --trigger-delay seconds, like a real probe
 waiting for a trigger, so cancel handling gets exercised.
 """

@@ -20,10 +20,11 @@ using namespace oscill;
 // Hardware mappings
 //
 // Register widths (1 / 2 / 4 bytes) and the V1 / TS / MC formulas were recovered from oscill.exe
-// (see docs/reverse-engineering.md). Items marked GUESS have not been confirmed.
+// and verified on hardware where noted (see docs/Protocol.md). Items marked GUESS have not been confirmed.
 //   1 byte: O1 M1 T1 S1 RT AP AR RS   2 bytes: MC V1 QS TC   4 bytes: TS TD TA TW
 
-//Run modes written to the RT register (order from the vendor UI: Free / Auto / Norm / Wait)
+//Run modes written to the RT register. The driver only uses RUN_FREE (0, verified); the other values follow the
+//original guess and are unconfirmed (see docs/Protocol.md, "Trigger").
 enum RunMode : uint8_t
 {
 	RUN_FREE	= 0,
@@ -59,11 +60,11 @@ static const uint8_t T1_EDGE_MASK	= T1_FALLING | T1_RISING;
 
 //Timer registers (TD trigger delay, TA / TW auto / wait timeouts) count units of 12000 MCU clocks
 static const double TIMER_TICK_CLOCKS = 12000;
-static const double AUTO_TIMEOUT_S = 0.1;
+static const double AUTO_TIMEOUT_S = 0.1;		//Auto mode: free-run after this long without a trigger
 
-//Software trigger (the hardware trigger does not gate captures on fw 1.26; see CLAUDE.md)
+//Software trigger (the hardware trigger does not gate captures on fw 1.26; see docs/Protocol.md)
 static const size_t JUNK_SAMPLES = 2;			//first samples of every record are garbage (~250, ~66)
-static const double SW_TRIGGER_HYST_CODES = 3;	//noise is about +-2..3 codes		//Auto mode: free-run after this long without a trigger
+static const double SW_TRIGGER_HYST_CODES = 3;	//noise is about +-2..3 codes
 
 //Vertical scale. V1 = volts/div in millivolts (oscill.exe: V1 = range * 1000 / 8, 8 divisions full screen).
 //The 1-2-5 steps match the vendor UI; the exact span the hardware accepts is not known.
@@ -151,6 +152,10 @@ OscillOscilloscope::OscillOscilloscope(SCPITransport* transport)
 		LogError("Oscill: probe did not answer the OBEX CONNECT handshake\n");
 		return;
 	}
+
+	//Trigger point in the middle of the record actually delivered (QS minus the junk samples)
+	if(m_lastDepth > JUNK_SAMPLES)
+		m_triggerOffset = GetSamplePeriodFs() * (int64_t)((m_lastDepth - JUNK_SAMPLES) / 2);
 
 	PullTrigger();
 	PushAll();

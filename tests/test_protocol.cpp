@@ -1,4 +1,4 @@
-// Unit tests for the Oscill OBEX framing helpers. Byte sequences are taken from docs/oscill-proto.md.
+// Unit tests for the Oscill OBEX framing helpers. Byte sequences follow docs/Protocol.md, many captured from a real probe.
 
 #include "OscillProtocol.h"
 

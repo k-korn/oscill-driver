@@ -67,7 +67,7 @@ static Bytes NameHeader(uint8_t headerId, const string& name)
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Frame construction
 //
-// Layouts below were confirmed by disassembling oscilink.dll v1.04.0003 (see docs/reverse-engineering.md).
+// Layouts below come from oscilink.dll v1.04.0003 and are verified on hardware (see docs/Protocol.md).
 
 Bytes BuildConnect(uint16_t maxPacket)
 {

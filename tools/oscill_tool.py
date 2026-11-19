@@ -197,7 +197,7 @@ def main():
     sw.add_argument("start", type=int)
     sw.add_argument("stop", type=int)
     sw.add_argument("--type", choices=list(MARKERS) + ["auto"], default="auto")
-    sp = sub.add_parser("speed", help="switch link speed (1843200/n) and verify with GET 'F'")
+    sp = sub.add_parser("speed", help="switch link speed (1843200/n), verify with CONNECT, switch back")
     sp.add_argument("new_baud", type=int, metavar="baud")
     raw = sub.add_parser("raw")
     raw.add_argument("bytes", nargs="+")
