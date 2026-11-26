@@ -5,32 +5,39 @@ bridge. This document is everything known about that protocol. Driver-specific c
 
 ## Sources and confidence
 
-Each finding below is tagged with where it comes from:
+Each finding is tagged with where it comes from:
 
-* **[HW]**: verified on a real probe (S/N 3404, hardware 1.25, firmware 1.26), with `tools/oscill_tool.py` and the
+* **[VD]**: the vendor's protocol documents (Russian), `oscilobex.pdf` (framing) and `oscill.pdf` (properties,
+  registers, commands, data format). Copies are published in the
+  [yavfast/Oscill2](https://github.com/yavfast/Oscill2) repository under `docs/protocol/`; they're not reproduced here.
+* **[HW]**: verified on a real probe (S/N 3404, hardware 1.25, firmware 1.26) with `tools/oscill_tool.py` and the
   driver's smoke test.
-* **[RE]**: read from the vendor's Windows software (static analysis only, nothing executed): `oscill.exe` v1.4.7 and
-  `oscilink.dll` v1.04.0003 (both 2013-09-07, Visual Basic 5 native code, UPX-packed). `RE` addresses refer to the
-  unpacked files (`oscilink.dll` image base `0x11000000`, `oscill.exe` `0x400000`).
-* **[presumed]**: consistent with everything seen, but not directly proven.
+* **[RE]**: read from the vendor's Windows software (static analysis only): `oscill.exe` v1.4.7 and `oscilink.dll`
+  v1.04.0003 (both 2013-09-07, Visual Basic 5 native code, UPX-packed). Addresses refer to the unpacked files
+  (`oscilink.dll` image base `0x11000000`, `oscill.exe` `0x400000`).
+* **[presumed]**: consistent with everything seen, not directly proven.
 
-The protocol description that this work started from was largely wrong (register meanings, value encodings, units);
-nothing in this document relies on it.
+Where the hardware disagrees with the vendor document, this document says so and follows the hardware.
 
 ## Physical link
 
 * **USB-UART bridge.** The tested probe enumerates as Silicon Labs CP210x `10c4:ea61` ("Oscill USB interface") and
   appears as `/dev/ttyUSB*` via the kernel `cp210x` driver. [HW] The vendor software also looks for `10c4:840e`
-  (via Silabs USBXpress) and Prolific `067b` VCP adapters. [RE] For `840e`, bind the driver by hand:
+  (via Silabs USBXpress) and Prolific `067b` adapters. [RE] For `840e`, bind the driver by hand:
   `echo 10c4 840e | sudo tee /sys/bus/usb-serial/drivers/cp210x/new_id`.
-* **8N1, no flow control, 9600 baud at power-up.** [HW] Faster rates are switched in-band (see [Link speed](#link-speed)).
-* **Keep DTR and RTS low, and never toggle them.** If the modem lines change when the port opens or closes, the probe
-  resets into its **bootloader** (see [Bootloader](#bootloader-boot-state)). Clear `HUPCL` so Linux doesn't drop DTR
-  on close (`stty -F /dev/ttyUSB1 -hupcl`), and set DTR/RTS low immediately after opening. [HW]
+* **8N1, no flow control. A session always starts at 9600 baud** [VD, HW]; faster rates are switched in-band
+  ([Link speed](#link-speed)).
+* **Keep DTR and RTS low.** Toggling them reset the probe into its bootloader ([BOOT state](#bootloader-boot-state)).
+  [HW] Note for Linux:
+  * opening a tty that no one else has open raises DTR and RTS;
+  * setting baud rate 0 (`B0`) drops them, and leaving `B0` (setting any real rate) raises them again: the cp210x
+    driver does this. libscopehal's `uart` transport sets `B0` when it opens the port (its termios has no baud bits),
+    so lines must be cleared *after* the real baud rate is set;
+  * clear `HUPCL` so closing the port leaves the lines alone.
 
 ## Packet framing
 
-Requests and replies are OBEX packets:
+Requests and replies are OBEX packets [VD, HW]:
 
 ```
 +------------+------------------+----------------------------+
@@ -40,47 +47,47 @@ Requests and replies are OBEX packets:
 +------------+------------------+----------------------------+
 ```
 
-Headers follow OBEX rules. The top two bits of the header ID give its encoding [RE, HW]:
+The top two bits of a header ID give its encoding [VD, HW]:
 
 | ID range | Encoding |
 |---|---|
-| `0x00`–`0x3F` | Unicode text, 2-byte length (including the 3-byte header) |
+| `0x00`–`0x3F` | null-terminated Unicode text, 2-byte length (including the 3-byte header) |
 | `0x40`–`0x7F` | byte sequence, 2-byte length (including the 3-byte header) |
 | `0x80`–`0xBF` | 1-byte value |
 | `0xC0`–`0xFF` | 4-byte big-endian value |
 
-### Opcodes
+### Opcodes [VD]
 
-| Opcode | Use | Status |
+| Opcode | Meaning | Use |
 |---|---|---|
-| `0x80` | CONNECT | [HW] |
-| `0x81` | DISCONNECT | [RE] `0x11037a50`; not needed |
-| `0x82` | GET: single commands (`r` header) | [HW] |
-| `0x83` | PUT: register reads and writes | [HW] |
+| `0x80` | CONNECT | start a session [HW] |
+| `0x81` | DISCONNECT | end a session; not needed |
+| `0x82` | PUT | register writes, calibrate command [HW] |
+| `0x83` | GET | property / register reads, digitize command [HW] |
+| `0xFF` | Abort | stop the current operation (multi-packet transfer, ROLL stream) |
 | `0x91` | link speed change | [HW] |
-| `0x9b` | Bluetooth module setup | [RE] `0x1103e2f0`; not needed over USB |
-| `0xA0` | reply: success | [HW] |
-| `0xD0` | reply: error / not supported | [HW] |
+| `0x92` | repeat the last response | for corrupted replies; not used |
+| `0xA0` | reply: Success | [HW] |
+| `0x90` | reply: Continue | ROLL-mode data packets |
+| `0xA4`, `0xC0`, `0xD0`, `0xD1` | replies: No Content, Bad Request, Internal Server Error, Not Implemented | the probe answers unsupported requests with `d0 00 03` [HW] |
 
-### Header IDs
+### Header IDs [VD]
 
-| ID | ASCII | Meaning |
-|---|---|---|
-| `0x70` | `p` | read-only register name (read request) |
-| `0x71` | `q` | settings register name (read or write) |
-| `0x72` | `r` | single command |
-| `0x49` | | OBEX End-of-Body: carries waveform data and the `F` string |
-| `0x05` | | OBEX Description: only seen in the bootloader's CONNECT reply |
-| `0xB1` | | 1-byte value |
-| `0xF0` | | 2-byte register value, zero-extended into a 4-byte quantity |
-| `0xF1` | | 4-byte value |
+| ID | Meaning |
+|---|---|
+| `0x70` (`p`) | property name (read-only, 3 ASCII chars: `70 00 06 ...`) |
+| `0x71` (`q`) | register name (2 ASCII chars: `71 00 05 ...`) |
+| `0x72` (`r`) | command (1 ASCII char: `72 00 04 ...`) |
+| `0x49` | End-of-Body: carries waveform data |
+| `0x48` | Body (a non-final part of a multi-packet object) |
+| `0x01` | Name (Unicode): alternative way to name a register; not needed |
+| `0x05` | Description: only seen in the bootloader's CONNECT reply [HW] |
+| `0xB1` | 1-byte value |
+| `0xF0` | 2-byte value, sent as 4 bytes whose first two are `00 00` |
+| `0xF1` | 4-byte value |
+| `0xB0` | optional checksum: makes the byte sum of the whole packet 0 mod 256; not used |
 
-`B1`/`F0`/`F1` are OBEX 1-byte and 4-byte quantity headers. `F0` vs `F1` distinguishes 2-byte from 4-byte registers;
-it says nothing about signedness. [RE, HW]
-
-The vendor DLL also has an alternative framing mode (register names in a standard OBEX Name header `01 LL LL …` and
-values wrapped in `49` End-of-Body headers), and optional checksum / repeat / re-request modes. [RE] None of these are
-used by the probe's default configuration and they aren't needed.
+The probe supports headers `01 70 71 72 F0 F1 49 B1`. [VD]
 
 ## Session
 
@@ -101,134 +108,167 @@ RX  a0 00 14 10 00 04 80 05 00 0d 00 42 00 4f 00 4f 00 54 00 00
                          `-- OBEX Description header: UTF-16 "BOOT"
 ```
 
-Every other request then gets `d0 00 03`. Unplug and replug to recover. The vendor app treats this state as "need to
-upload firmware" — don't. [HW, RE `0x4fad60`]
+Every other request then gets `d0 00 03`. Unplug and replug to recover. The vendor app treats this state as "upload
+firmware" (command `F`); don't. [HW, RE `0x4fad60`]
 
-### Recommended start-up sequence
+### Start-up sequence
 
-1. CONNECT at 9600 (or at the last-used rate first, in case the probe was left there).
-2. Optionally switch link speed (`0x91`), then verify with CONNECT.
-3. **Send GET `C` once.** Without it, GET `D` returns a stale buffer (all 255) that ignores every setting. After one
-   `C`, the samples follow the input. [HW]
-4. Read and write registers as needed.
+1. CONNECT at 9600 (or first at the last-used rate, in case the probe was left there).
+2. Optionally switch the link speed (`0x91`), then verify with CONNECT.
+3. **Calibrate: PUT `C`.** Without it, GET `D` returned a stale buffer (all 255) that ignored every setting. [VD, HW]
+4. Read and write registers as needed. The vendor document recommends reading a register back after writing it, and
+   re-reading the registers that depend on it. [VD]
 
-## Single commands (`r` header)
+An Abort (`ff 00 03`) before CONNECT is harmless; at idle firmware 1.26 sent no reply to it. [HW]
 
-```
-TX  82 00 07 72 00 04 <cmd>
-```
+## Commands (`r` header)
 
-| Command | Meaning | Reply |
-|---|---|---|
-| `D` | fetch a waveform record | see below [HW] |
-| `C` | cancel / reset acquisition | `a0 00 03` [HW] |
-| `F` | firmware ID string | **rejected (`d0 00 03`) by the oscilloscope firmware 1.26.** It answered once, apparently from the bootloader: `a0 00 1a 72 00 04 46 49 00 13 "Uosc1.2534041.21"` (the string inside a `49` header). [HW] Use the `V*` registers instead. |
-
-### Waveform record (`D`)
-
-```
-a0 01 0c | 72 00 04 44 | 49 01 05 | m0 m1 m2 m3 | 254 samples
-reply      echoed 'D'    End-of-   metadata      8-bit unsigned
-                         Body
-```
-
-* **Samples**: one byte each, count = `QS` (254 at power-up, 172 seen later). [HW]
-* **The first two samples of every record are garbage** (typically ≈ 240–255, then ≈ 66). Discard them. [HW]
-* **Metadata**: byte 0 echoes the `T1` edge bits (`0x20` rising, `0x10` falling) in `RT` modes 1 and 3, and is `0x00`
-  in `RT` 2; values `0x10`–`0x30` also seen in free run. Byte 2 was `0x04` at fast `TS` and `0x00` at slow `TS`.
-  Otherwise unknown. [HW]
-* **Empty record**: `a0 00 0a 72 00 04 44 49 00 03`, i.e. a body with no data. Seen in `RT` = 1 shortly after
-  arming, at fast `TS` with a floating input; it means "nothing yet, ask again". [HW]
-* Transfer time per record: ~0.33 s at 9600 baud, ~0.04 s at 921600. [HW]
-* **The reply comes when a fresh record has been acquired**, i.e. one record duration (`QS` × sample period) after
-  the request, plus the transfer: 0.04 s at 6.4 kS/s, 0.26 s at 1 kS/s, 1.28 s at 200 S/s, 5.1 s at 50 S/s. [HW]
-* **While acquiring, the probe does not process commands.** A GET `C` sent during a 5 s record got no ACK, and the
-  requests after it went unanswered or came back mixed up. The only safe way to end an outstanding `D` is to wait
-  for its reply. Likewise, never send while a reply is being transmitted: the probe restarts the reply. [HW]
-
-## Registers
-
-There are two kinds, accessed differently. Using the wrong method gives `d0 00 03`. [HW]
-
-### Read-only constants (3-letter names): `p` read
-
-```
-TX  83 00 09 70 00 06 'M' 'C' 'l'
-RX  a0 00 0e 70 00 06 'M' 'C' 'l' f0 00 00 03 20        MCl = 800
-```
-
-The reply echoes the name header, then carries the value as a separate header. [HW] (The vendor DLL also sends
-these with opcode `0x83`, not GET. [RE `0x11039770`])
-
-### Settings (2-letter names): `q` query and write
-
-```
-read:   TX  83 00 08 71 00 05 'R' 'T'
-        RX  a0 00 0a 71 00 05 'R' 'T' b1 00                 RT = 0
-
-write:  TX  83 00 0a 71 00 05 'O' '1' b1 01                 O1 := 1
-        RX  a0 00 0a 71 00 05 'O' '1' b1 01                 echo of the value now in effect
-```
-
-* The `q` header's length covers **only the name**; the value follows as its own header. [RE, HW]
-* Write values by width: 1 byte `B1 vv`, 2 bytes `F0 00 00 hi lo`, 4 bytes `F1 b3 b2 b1 b0`. [RE `0x1103f720`, HW]
-* **The write reply echoes the value actually applied**, which can differ from the one sent (writing `MC` = 1991
-  echoed 1982). [HW]
-* GET (`0x82`) with a name-only `q` header just returns `a0 00 03` and reads nothing. [HW]
-
-### Register reference
-
-Widths come from which `PutGet{One,Two,Four}byteRegister` method the vendor app uses for each name [RE] and match
-the probe's replies [HW].
-
-#### Read-only
-
-| Reg | Width | Meaning | Value read on S/N 3404 |
+| Command | Packet | Meaning | Reply |
 |---|---|---|---|
-| `VNM` | 4 | model, 4 ASCII chars | `Uosc` [HW] |
-| `VSN` | 4 | serial number, 4 ASCII chars | `3404` [HW] |
-| `VHW` | 4 | hardware version, 4 ASCII chars | `1.25` [HW] |
-| `VSW` | 4 | firmware version, 4 ASCII chars | `1.26` [HW] |
-| `MCl` | 2 | minimum `MC` (10 ps units) | 800 = 8 ns, 125 MHz [HW] |
-| `MCh` | 2 | maximum `MC` | 5425 = 54.25 ns, 18.4 MHz [HW] |
-| `MCd` | 2 | default `MC` | 1248 [HW] |
-| `TMl`, `TMh` | 2 | unknown. **Not `TS` limits** (the probe accepts `TS` far above `TMh`) | 25, 256 [HW] |
-| `TCh` | 2 | maximum `TC` | 252 [HW] |
-| `QSh` | 2 | maximum `QS` (record length); **depends on the sample rate** | 254 at `TS` = 512 (25 MS/s), 1788 at ≤ 1 MS/s [HW] |
-| `TOv`, `TOl`, `TPl`, `Fbw` | | read by the vendor app; meaning unknown [RE] | |
-| `P1h`, `P1l` | | listed by the vendor app; rejected by fw 1.26 [HW] | |
+| `C` | `82 00 07 72 00 04 43` (PUT) | self-calibration (zero, offset and trigger level scaling) | `a0 00 03` [VD, HW] |
+| `D` | `83 00 07 72 00 04 44` (GET) | wait for the trigger, digitize, return the record | see below [VD, HW] |
+| `F` | | **firmware load. Never send it.** | |
 
-#### Settings
+### Digitize (`D`)
+
+```
+a0 01 0c | 72 00 04 44 | 49 01 05 | a0 a1 | c0 c1 | n0 n1 | samples
+reply      echoed 'D'    End-of-   digit.  channel  size     8-bit unsigned
+                         Body      attrs   attrs    field
+```
+
+* **Digitization attributes, byte `a0`** [VD, HW]:
+  * bit 0: RIS; bit 1: parallel (sent while digitizing); bit 2: endless (ROLL);
+  * **bits 5–4: trigger source**: `00` timeout (Auto mode), `01` falling edge, `10` rising edge. `11` is undefined in
+    the document but appeared in about half of the triggered records with a fast signal [HW];
+  * bits 7–6: number of channels − 1.
+* `a1`, `c1`: reserved. **`c0` bits 2–0: sample format**, `100` = one byte per sample (`M1` = 4). [VD, HW]
+* **Size field** `n0 n1`: the channel's array size in bytes per the document. On firmware 1.26 it holds garbage
+  (≈ 240–255, then ≈ 66), so take the sample count from the header length. [VD, HW]
+* **Samples**: `QS` bytes, one per sample (in normal mode). [HW]
+* **Wait-mode timeout**: `a0 00 0a 72 00 04 44 49 00 03`, an empty End-of-Body: no trigger within `TW`. [VD, HW]
+* **Timing**: the reply comes after the trigger (or timeout), plus the rest of the record (`QS` × sample period),
+  plus the transfer: ~0.33 s per 254-sample record at 9600 baud, ~0.04 s at 921600. [HW]
+* **Digitizing can't be interrupted.** A command sent during a 5 s record got no ACK, and the requests after it went
+  unanswered or came back mixed up. Sending while a reply is being transmitted restarts the reply. The only safe way
+  to end an outstanding `D` is to wait for it: allow for the longest trigger wait plus the record. [VD, HW]
+
+Other modes (RIS, parallel transfer, ROLL with `0x90` Continue packets ended by Abort) are described in the vendor
+document; none of them were tested.
+
+## Properties and registers
+
+* **Properties** (read-only, 3-letter names): GET with a `p` header. The reply echoes the name, then the value. [VD, HW]
+
+  ```
+  TX  83 00 09 70 00 06 'M' 'C' 'l'
+  RX  a0 00 0e 70 00 06 'M' 'C' 'l' f0 00 00 03 20        MCl = 800
+  ```
+
+* **Registers** (2-letter names): read with GET and a name-only `q` header; write with PUT, `q` header and a value
+  header (`B1 vv`, `F0 00 00 hi lo`, `F1 b3 b2 b1 b0`, by register width). [VD, HW]
+
+  ```
+  read:   TX  83 00 08 71 00 05 'R' 'T'
+          RX  a0 00 0a 71 00 05 'R' 'T' b1 00                 RT = 0
+  write:  TX  82 00 0a 71 00 05 'O' '1' b1 01                 O1 := 1
+          RX  a0 00 03                                         plain Success
+  ```
+
+  * The `q` header's length covers only the name; the value is its own header. [VD, HW]
+  * **The probe may apply a different value than written** (`TS` 514 → 512, `MC` 1991 → 1982), so read it back. [VD, HW]
+  * A GET with a value header also writes, and echoes the applied value. [HW]
+  * The wrong access method gets `d0 00 03`. [HW]
+
+### Properties
+
+| Name | Width | Meaning | S/N 3404 |
+|---|---|---|---|
+| `VNM`, `VSN`, `VHW`, `VSW` | 4 | model, serial number, hardware and firmware version, 4 ASCII chars each | `Uosc`, `3404`, `1.25`, `1.26` [HW] |
+| `VHD`, `VHA`, `VSD`, `VSI`, `VSC`, `VSO` | 4 | versions of the digital / analog boards and firmware parts [VD] | |
+| `MCd` | 2 | default `MC` (10 ps units) | 1248 [HW] (document example: 2000) |
+| `MCl`, `MCh` | 2 | minimum / maximum `MC` | 800, 5425 [HW] |
+| `TOl` | 2 | fastest sample period (clocks × 256) at which any `TS` is allowed; faster only the values in `TOv` [VD] | |
+| `TOv` | 4 | bit map of the allowed fast clocks-per-sample values (½, 1, 2 … 30) [VD] | |
+| `TMl`, `TMh` | 2 | RIS sample period range (clocks × 256) [VD] | 25, 256 [HW] |
+| `TPl` | 4 | fastest sample period for parallel / ROLL acquisition [VD] | |
+| `TCh` | 2 | maximum pre-trigger samples; depends on `TS`, `RS`, `M1`, `AP` [VD] | 252 at `TS` = 512, 1787 at ≤ 1 MS/s [HW] |
+| `QSh` | 2 | maximum record length; same dependencies [VD] | 254 at `TS` = 512, 1788 at ≤ 1 MS/s [HW] |
+| `V1h`, `V1l` | 2 | volts/div limits (mV) [VD] | |
+| `P1h`, `P1l` | 2 | offset limits, signed, 1/256 of the ADC range; depend on `V1` [VD] | |
+| `D1m` | 2 | trigger comparator delay (10 ps units) [VD] | |
+
+### Registers
 
 | Reg | Width | Meaning | Status | Power-up |
 |---|---|---|---|---|
-| `V1` | 2 | vertical scale in **mV/div** | [HW] battery test | 10000 |
-| `TS` | 4 | sample period in MCU clocks × 256 | [HW] 50 Hz test | 512 |
-| `MC` | 2 | MCU clock period, **10 ps units** | [HW] | 1991 |
-| `QS` | 2 | record length in samples; doesn't change with `TS` (the 172 once seen was left by the vendor app) | [RE `0x4c0f38`], matches record size [HW] | 254 |
-| `O1` | 1 | input options (bit map, below) | [HW] | 0 |
-| `M1` | 1 | acquisition mode: Sample / Average / HiRes / Peak | [RE `0x4b5fc0`] | 0 |
-| `RT` | 1 | run / trigger mode | see [Trigger](#trigger) | 0 |
-| `S1` | 1 | trigger level, ADC code scale [presumed] | [RE `0x4b9580`] | 127 |
-| `T1` | 1 | trigger configuration (bit map, below) | [RE `0x4b7770`] | 0x30 |
-| `TC` | 2 | pre-trigger sample count, ≤ min(`TCh`, `QS`) | [RE `0x4c3040`] | — |
-| `TD` | 4 | trigger delay, timer units (below) | [RE `0x4c79e0`] | 0 |
-| `TA` | 4 | Auto-mode timeout, timer units | [RE `0x4c7b80`] | 65280 |
-| `TW` | 4 | Wait-mode timeout, timer units | [RE `0x4c7d20`] | 65280 |
-| `AP`, `AR`, `RS` | 1 | unknown (`RS` probably RIS) | | 0, 1, 0 |
+| `MC` | 2 | machine cycle (clock period), **10 ps units**; drifts by itself (1991, 1982, 1993, 2000 seen) | [VD, HW] | 1991 |
+| `TS` | 4 | sample period, **clocks × 256**; highest priority, set it first | [VD, HW] | 512 |
+| `RS` | 1 | acquisition method: bit 0 RIS, bit 1 parallel transfer, bit 2 ROLL | [VD] | 0 |
+| `AP` | 1 | averaging / peak passes − 1 (a power of 2) | [VD] | 0 |
+| `QS` | 2 | record length in samples, ≤ `QSh` | [VD, HW] | 254 |
+| `TD` | 4 | delay from trigger to the start of digitizing, **units of 12 clocks** | [VD] | 0 |
+| `TC` | 2 | pre-trigger samples (trigger position in the record), ≤ `TCh` | [VD, HW] | |
+| `RT` | 1 | run mode, below | [VD, HW] | 0 |
+| `TA` | 4 | Auto-mode trigger timeout, **units of 12 clocks** | [VD, HW] | 65280 |
+| `TW` | 4 | Wait-mode trigger timeout, **units of 12 clocks** | [VD, HW] | 65280 |
+| `AR` | 1 | minimum passes per delay in RIS mode | [VD] | 1 |
+| `O1` | 1 | input options, below | [VD, HW] | 0 |
+| `V1` | 2 | sensitivity, **mV/div** | [VD, HW] | 10000 |
+| `P1` | 2 | offset, signed, 1/256 of the ADC range, within `P1l`…`P1h` | [VD]; not used | |
+| `M1` | 1 | sample processing, below | [VD, HW] | 0 |
+| `T1` | 1 | trigger configuration, below | [VD, HW] | 0x30 |
+| `S1` | 1 | trigger level, 1/256 of the ADC range (= ADC code) | [VD, HW] | 127 |
 
-**`O1`, input options** [HW] (battery and 50 Hz tests; names from the vendor app's buttons):
+**`RT` run mode** [VD, HW]:
 
-| Bit | Vendor button | Effect |
+| Value | Mode | Behaviour of `D` |
 |---|---|---|
-| 0 | **Gnd** | input grounded: a noiseless 128 regardless of input |
-| 1 | **DC** (released) | **AC coupling** when set; clear = DC |
-| 2 | **Filt L** | low-pass, ~3 MHz [presumed: no visible effect at ≤ 200 kS/s] |
-| 3 | **Filt H** | **high-pass, ~3 kHz**: a 500 mV 50 Hz signal drops to ~5 mV; fast edges pass and decay |
+| 0 | Auto | waits up to `TA` for a trigger, then digitizes anyway (source bits `00`) |
+| 1 | Wait | waits up to `TW`; on timeout returns the empty End-of-Body |
+| 2 | Free run | digitizes immediately (firmware ≥ 1.25) |
+| 3 | Wait forever | waits until a trigger (firmware ≥ 1.25); the request can then only end with a trigger |
 
-**`T1`, trigger configuration** [RE]: bits 0–1 falling hysteresis, bits 2–3 rising hysteresis, bit 4 falling edge,
-bit 5 rising edge (both = either edge), bits 6–7 trigger "speed" (vendor combo, e.g. "Fastest"). Read back
-correctly, but see [Trigger](#trigger).
+**`O1` input options** [VD, HW]:
+
+| Bit | Vendor button | Meaning |
+|---|---|---|
+| 0 | Gnd | input grounded (reads a noiseless 128) |
+| 1 | DC (released) | AC coupling when set |
+| 2 | | **~3 MHz low-pass** |
+| 3 | | **~3 kHz low-pass** ("up to 200 mV/div" per the document) |
+
+Hardware tests of the filters, with a 1.348 V battery:
+
+* Neither filter blocks DC: 1.33–1.37 V with each bit and both. Bit 2 adds about +40 mV of offset at 0.5 V/div and
+  lowers the noise slightly.
+* Step response at 1 MS/s, 200 mV/div: with bit 2 a step still rises within 1–2 samples; with bit 3 (alone or with
+  bit 2) it ramps at ~1 code/µs, 10–90 % in 40–90 µs, i.e. a corner somewhere around 0.5–3 kHz.
+* With a high-impedance source (a wire picking up mains hum), bit 3 cut 500 mV of 50 Hz down to ~5 mV: the filter's
+  input capacitance divides such a source down. This is not a high-pass.
+
+**`M1` sample processing**, bits 2–0 [VD]:
+
+| Value | Mode | Data |
+|---|---|---|
+| 0 | averaging, low bits dropped (**power-up value**) | 1 byte per sample |
+| 1 | averaging, higher resolution | 2 bytes per sample |
+| 2 | peak, alternating min / max | 1 byte per sample |
+| 3 | peak, min and max per sample | 2 bytes per sample |
+| 4 | **normal: one ADC sample per sample** | 1 byte per sample [HW] |
+
+Averaging and peak modes aren't available with RIS / parallel acquisition or at short sample periods. Only 4 was
+tested.
+
+**`T1` trigger configuration** [VD, HW]:
+
+| Bits | Meaning |
+|---|---|
+| 5 | trigger on rising edge |
+| 4 | trigger on falling edge (both bits: either edge, verified) |
+| 3–2 | rising-edge hysteresis: `11` on, `00` off |
+| 1–0 | falling-edge hysteresis: `11` on, `00` off |
+| 7–6 | `00` HF + LF trigger path, `11` LF only |
 
 ## Scaling
 
@@ -238,78 +278,65 @@ correctly, but see [Trigger](#trigger).
 volts = (code − 128) × (V1 / 1000) × 8 / 256
 ```
 
-Code 128 is 0 V, and the 256 codes span 8 divisions. Measured with a 1.361 V battery: 0.5 V/div gave 128.2 (shorted),
-215.0 (+), 42.2 (reversed); reversed at 1 V/div 85.0 and at 5 V/div 119.4. All within 1% of the formula. Noise is
+Code 128 is 0 V and the 256 codes span 8 divisions. Measured with a 1.361 V battery: 0.5 V/div gave 128.2 (shorted),
+215.0 (+), 42.2 (reversed); reversed at 1 V/div 85.0 and at 5 V/div 119.4. All within 1 % of the formula. Noise is
 about ±2–3 codes. The vendor app offers 20 mV/div to 10 V/div in 1-2-5 steps.
 
-### Time [HW]
+The vendor document instead puts 240 levels on the 8 divisions ("8.53 mV per ADC range unit"), which would be a
+6.7 % larger scale; the battery measurements don't support that.
+
+### Time [VD, HW]
 
 ```
 sample period = TS / 256 × MC × 10 ps
 ```
 
-Confirmed with 50 Hz mains: `TS` = 2030000, `MC` = 1982 → 157.2 µs/sample, and the hum repeated every 126 samples
-(50.5 Hz). `TS` is a fixed-point clock divider: 256 = one sample per clock.
+Confirmed with 50 Hz mains: `TS` = 2030000, `MC` = 1982 → 157.2 µs/sample, and the hum repeated every 126 samples.
 
-**At fast rates the probe uses whole clocks**: writing `TS` = 514 applies 512, 12845 applies 12800; 128450 and above
-were applied unchanged. Use the value echoed by the write. [HW]
+* **At fast rates only whole or listed clock counts are allowed** (`TOl` / `TOv`): writing `TS` = 514 applied 512,
+  12845 applied 12800; 128450 and above were applied unchanged. Read `TS` back. [VD, HW]
+* **`MC` drifts**: read it before converting. The vendor app retunes `MC` so the sample period comes out exact:
+  `MC = round(Tsample × 1e11 × 256 / TS)` [RE `0x4c0e8a`]. Plain `TS = round(256 × Tsample / Tclock)` with the probe's
+  `MC` works too.
 
-`MC` (the clock period) **drifts by itself**: 1991 at power-up, 1982 after writing 1991, later 1993, 2000. Read it
-before converting. The vendor app retunes `MC` so the sample period comes out exact:
-`MC = round(Tsample × 1e11 × 256 / TS)` [RE `0x4c0e8a`]. Its `TS` choice is
-`TS = max(TMl, (2·TMh) div max(2, ceil(2·TMh / (x + 1))))` with `x = 256 × Tsample / Tclock` [RE `0x4c0a30`];
-on hardware a plain `round(256 × Tsample / Tclock)` works.
+### Timer units (`TD`, `TA`, `TW`) [VD, HW]
 
-### Timer units (`TD`, `TA`, `TW`) [RE `0x4c7ea0`]
+**One count = 12 machine cycles** (≈ 240 ns at 50 MHz). `TW` = 4166667 timed out after 1.00 s; the power-up 65280 is
+~15.7 ms.
 
-The vendor app stores these settings in milliseconds and converts with `value = ms × 8333.33 / MC`, i.e. **one count
-per 12,000 MCU clocks** (150 µs at 80 MHz, ~240 µs at 50 MHz). The power-up 65280 is therefore ~15.6 s at 50 MHz.
+### Trigger position [HW]
+
+With `RT` = 0 or 1 and a hardware trigger, the trigger crossing lands just before sample `TC` of the record (counting
+the samples after the size field): the first sample past the level was 0–4 samples before `TC`, 2 on average (rising
+1.4, falling 2.6), over 48 captures at `TC` 50, 127 and 200. The interpolated crossing is about 2.5 samples before
+`TC`. The trigger fires on any crossing of `S1`, including narrow spikes.
 
 ## Link speed
 
 ```
-TX  91 00 04 <1843200 / baud>          9600 → c0, 115200 → 10, 921600 → 02
+TX  91 00 04 <divisor>        rate = 1843200 / divisor: 9600 → c0, 115200 → 10, 921600 → 02
 ```
 
-* **The probe acknowledges at the new rate**, so the reply is garbage at the old one; don't read it. Switch the host,
-  then verify with CONNECT. [HW]
-* Don't verify with GET `F`: firmware 1.26 rejects it, which can make a working switch look failed. [HW]
-* If the probe is stuck at a high rate: connect at that rate and send `91 00 04 c0`. [HW]
-* The vendor app switches back to 9600 before closing. [RE `0x110372e0`]
-* 921600 confirmed: ~0.04 s per record instead of ~0.33 s. [HW]
+* The document writes 1842000; 1843200 is what works. [VD, HW]
+* The probe acknowledges **at the old rate** and then switches; the driver discards the acknowledgement, switches the
+  host and verifies with CONNECT. [HW]
+* If the probe is stuck at a high rate: connect at that rate and send `91 00 04 c0`. The vendor app switches back to
+  9600 before closing. [HW, RE `0x110372e0`]
 
-## Trigger
+## Error recovery [VD]
 
-**On firmware 1.26 the hardware trigger does not gate or align captures.** [HW] Tested over 9600 and 921600 with
-50 Hz mains pickup and a clean spiky 50 Hz signal:
-
-* In `RT` = 0, 1, 2 and 3 alike, GET `D` returns the next record as soon as it's acquired, even with the level
-  (`S1`) set where the signal never reaches, and with `TA`/`TW` at 65280 or 300.
-* Signal features drift by a constant amount from one record to the next (e.g. spikes every 127 samples moving
-  ~26 samples per capture), exactly as in free run, independent of `TC` (50 / 100 / 200), `S1` and the edge bits.
-
-What the vendor app does around it [RE]:
-
-* `RT` is written from its mode drop-down's index. The tooltips are ordered Auto, Normal, Wait (infinite), Free, and
-  the screen shows buttons F / A / N / W, so the mapping is unconfirmed (the original guess 0 = Free, 1 = Auto,
-  2 = Normal, 3 = Wait may be wrong).
-* It has a "NO TRIGGER!" indicator and an "If no trigger occurs: clear / keep" setting, so the probe may always
-  return a record and report trigger status somewhere (metadata?). The `D` handler is `0x4f7aa0` →
-  `0x4ff440` / `0x55ead0`.
-* Unexplained: once, at `TS` = 512 with `RT` = 1 and a floating input, `D` returned empty bodies for 20 s. Not
-  reproduced at slow `TS`.
-
-Practical conclusion: run the probe in free run and trigger in software (see [Driver.md](Driver.md)).
+* A corrupted request gets `0xD0`; repeat it once.
+* For a corrupted or truncated response, request a repeat with `92 00 03`.
+* With no response at all, repeat the request after a guard time that covers the longest possible digitization.
 
 ## Unknowns
 
-* How the hardware trigger is meant to work, if at all, on this firmware; the `RT` value mapping.
-* Metadata bytes 1–3; full meaning of byte 0.
-* `TMl`, `TMh`, `TOv`, `TOl`, `TPl`, `Fbw`, `AP`, `AR`, `RS`, `D1m`, `G1`, `G2`, `Gs`, `Lt`, `L1`, `L2`.
-* Writing `QS` (longer records, up to `QSh`) hasn't been tested.
-* `M1` acquisition modes (Average / HiRes / Peak): not tested.
-* Exact filter cut-offs; the 3 MHz low-pass is unconfirmed.
-* RIS (equivalent-time sampling below one clock per sample; `TS` < 256), ROLL mode.
+* Metadata `11` trigger source; the reserved attribute bytes.
+* `QS` above the power-up 254 (up to `QSh`): accepted by the probe, not used by the driver.
+* `M1` averaging / peak modes, `AP`, RIS, parallel transfer, ROLL, `TD` delay, `P1` offset: untested.
+* The exact filter corners.
+* Why a freshly opened port sometimes got no answer at all (seen in ngscopeclient only, before DTR/RTS were really
+  held low; see Driver.md).
 
 ## Vendor software notes [RE]
 
@@ -320,5 +347,5 @@ Practical conclusion: run the probe in free run and trigger in software (see [Dr
   (vtable `+0x94`, `+0x98`, `+0x9c`, `+0x84` from `oscill.exe`).
 * Packet builders: CONNECT `0x110378e5`, single command `0x110392c0`, register read `0x11039770`, writes
   `0x11039850` / `0x110399c0` / `0x11039b10`, value encoder `0x1103f720`, name header `0x1103f390`, speed `0x1103e1e0`.
-* Other features in the app not used here: memory depth / pre-samples settings, ROLL mode, RIS, hardware offset limits,
-  "Aoffs" / "Asens" (auto offset / auto sensitivity), a "Delay" mode.
+* The app's buttons: Peak, DC, Avg, Gnd, HiRes, Filt H, Filt L. Other features not used here: memory depth /
+  pre-samples, ROLL, RIS, auto offset / sensitivity, delay mode.
