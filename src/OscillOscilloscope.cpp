@@ -238,15 +238,35 @@ bool OscillOscilloscope::Connect()
 		}
 
 		for(int retry = 0; retry < 2 && !ok; retry++)
+			ok = TryHandshake(true, CONNECT_TIMEOUT_MS, reply);
+	}
+
+	//Silent at both rates. Gather what the host side looks like, then try a few recoveries, logging which one (if
+	//any) works: this has been seen in ngscopeclient but never reproduced from a test program.
+	if(!ok)
+	{
+		LogWarning("Oscill: probe silent at %u and 9600 baud; %s\n", wantedBaud, m_port.DescribeState().c_str());
+
+		//1. Keep knocking: a probe stuck in the middle of a frame swallows bytes until the frame's length is reached
+		for(int k = 0; k < 15 && !ok; k++)
+			ok = TryHandshake(false, 300, reply);
+		if(ok)
+			LogWarning("Oscill: recovered by repeating CONNECT\n");
+
+		//2. DTR / RTS high (the state they were left in by earlier driver versions), then low again
+		for(int high = 1; high >= 0 && !ok; high--)
 		{
-			//Abort first: stops anything a previous session left running (e.g. a roll-mode stream)
-			SendFrame(BuildAbort());
-			m_port.Drain(100);
-			m_rxBuf.clear();
-			if(!SendFrame(BuildConnect()))
-				return false;
-			if(ReadFrame(reply, CONNECT_TIMEOUT_MS) && IsSuccess(reply))
-				ok = true;
+			m_port.SetModemLines(high);
+			usleep(500 * 1000);
+			for(int k = 0; k < 3 && !ok; k++)
+				ok = TryHandshake(false, CONNECT_TIMEOUT_MS, reply);
+			if(ok)
+				LogWarning("Oscill: recovered with DTR/RTS %s\n", high ? "high" : "low");
+		}
+		if(!ok)
+		{
+			m_port.SetModemLines(false);
+			LogWarning("Oscill: recovery failed; %s\n", m_port.DescribeState().c_str());
 		}
 	}
 	if(!ok)
@@ -316,6 +336,35 @@ bool OscillOscilloscope::Connect()
 		(unsigned long long)m_lastDepth);
 
 	return true;
+}
+
+/**
+	@brief Sends one CONNECT (after an Abort if requested) and waits for a successful reply. Anything else received is
+	logged, since a probe that answers with junk and one that doesn't answer at all are different problems.
+ */
+bool OscillOscilloscope::TryHandshake(bool abortFirst, int timeoutMs, Bytes& reply)
+{
+	if(abortFirst)
+	{
+		//Abort first: stops anything a previous session left running (e.g. a roll-mode stream)
+		SendFrame(BuildAbort());
+		size_t junk = m_port.Drain(100);
+		if(junk)
+			LogDebug("Oscill: %zu bytes received after Abort\n", junk);
+	}
+	m_rxBuf.clear();
+	if(!SendFrame(BuildConnect()))
+		return false;
+	if(!ReadFrame(reply, timeoutMs))
+	{
+		if(!m_rxBuf.empty())
+			LogDebug("Oscill: partial reply to CONNECT: %s\n", HexDump(m_rxBuf, 16).c_str());
+		return false;
+	}
+	if(IsSuccess(reply))
+		return true;
+	LogDebug("Oscill: unexpected reply to CONNECT: %s\n", HexDump(reply, 16).c_str());
+	return false;
 }
 
 /**

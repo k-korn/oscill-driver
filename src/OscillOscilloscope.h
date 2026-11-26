@@ -100,6 +100,7 @@ protected:
 	bool WriteReg2(const std::string& name, uint16_t value);
 	bool WriteReg4(const std::string& name, uint32_t value);
 	bool ChangeBaudRate(unsigned int baud);
+	bool TryHandshake(bool abortFirst, int timeoutMs, oscill::Bytes& reply);
 	void CancelPendingAcquisition();
 
 	void Resync();

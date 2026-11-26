@@ -40,7 +40,10 @@ public:
 	size_t Read(uint8_t* buf, size_t len, int timeoutMs);
 
 	///@brief Discards everything in the kernel RX buffer plus anything that arrives within quietMs
-	void Drain(int quietMs = 20);
+	size_t Drain(int quietMs = 20);		//returns the number of bytes thrown away
+
+	void SetModemLines(bool high);
+	std::string DescribeState();
 
 protected:
 	void Fail(const char* what, int err);

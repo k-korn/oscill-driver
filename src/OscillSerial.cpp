@@ -9,6 +9,9 @@
 #include "OscillSerial.h"
 
 #include <cerrno>
+#include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <chrono>
 #include <fcntl.h>
 #include <poll.h>
@@ -77,19 +80,105 @@ bool OscillSerial::Attach(SCPITransport* transport)
 
 	m_fd = OscillUartAccess::Get(uart).GetHandle();
 
-	//Hold DTR and RTS low. With these lines toggling on open/close the probe was observed to reset into its
-	//bootloader ("BOOT" in the CONNECT reply); with them held low it stays in the oscilloscope firmware.
-	int lines = TIOCM_DTR | TIOCM_RTS;
-	if(0 != ioctl(m_fd, TIOCMBIC, &lines))
-		LogDebug("Oscill: could not clear DTR/RTS (%s)\n", strerror(errno));
-
-	//Remember the baud rate the user asked for in the connection string
+	//Set the baud rate the user asked for in the connection string
 	auto cs = uart->GetConnectionString();
 	unsigned int baud = 9600;
 	auto colon = cs.find(':');
 	if(colon != string::npos)
 		baud = strtoul(cs.c_str() + colon + 1, nullptr, 10);
-	return SetBaudRate(baud ? baud : 9600);
+	if(!SetBaudRate(baud ? baud : 9600))
+		return false;
+
+	//Then hold DTR and RTS low (with them toggling the probe was seen to reset into its bootloader). This must come
+	//after setting the baud rate: libscopehal leaves the port at B0 (hang up, lines low), and leaving B0 makes the
+	//tty driver raise both lines again.
+	SetModemLines(false);
+	return true;
+}
+
+/**
+	@brief Drives DTR and RTS together
+ */
+void OscillSerial::SetModemLines(bool high)
+{
+	if(m_fd < 0)
+		return;
+	int lines = TIOCM_DTR | TIOCM_RTS;
+	if(0 != ioctl(m_fd, high ? TIOCMBIS : TIOCMBIC, &lines))
+		LogDebug("Oscill: could not %s DTR/RTS (%s)\n", high ? "set" : "clear", strerror(errno));
+}
+
+/**
+	@brief One line of host-side port state, for diagnosing a probe that doesn't answer
+ */
+string OscillSerial::DescribeState()
+{
+	if(m_fd < 0)
+		return "port closed";
+
+	int st = 0, outq = -1, inq = -1;
+	ioctl(m_fd, TIOCMGET, &st);
+	ioctl(m_fd, TIOCOUTQ, &outq);
+	ioctl(m_fd, TIOCINQ, &inq);
+	termios t;
+	memset(&t, 0, sizeof(t));
+	tcgetattr(m_fd, &t);
+
+	char path[256] = {0};
+	char link[64];
+	snprintf(link, sizeof(link), "/proc/self/fd/%d", m_fd);
+	ssize_t n = readlink(link, path, sizeof(path) - 1);
+	if(n > 0)
+		path[n] = 0;
+
+	char buf[512];
+	snprintf(buf, sizeof(buf), "fd %d -> %s, DTR=%d RTS=%d CTS=%d DSR=%d, out queue %d, in queue %d, "
+		"cflag 0x%x (CBAUD 0x%x), ospeed %u",
+		m_fd, path, !!(st & TIOCM_DTR), !!(st & TIOCM_RTS), !!(st & TIOCM_CTS), !!(st & TIOCM_DSR), outq, inq,
+		(unsigned)t.c_cflag, (unsigned)(t.c_cflag & CBAUD), (unsigned)cfgetospeed(&t));
+	string ret = buf;
+
+	//Anyone else holding the same device? (only our own user's processes are visible)
+	struct stat me;
+	if( (n > 0) && (0 == stat(path, &me)) )
+	{
+		if(auto proc = opendir("/proc"))
+		{
+			while(auto e = readdir(proc))
+			{
+				int pid = atoi(e->d_name);
+				if( (pid <= 0) || (pid == getpid()) )
+					continue;
+				string fddir = string("/proc/") + e->d_name + "/fd";
+				if(auto fds = opendir(fddir.c_str()))
+				{
+					while(auto f = readdir(fds))
+					{
+						struct stat st2;
+						if( (0 == stat((fddir + "/" + f->d_name).c_str(), &st2)) && S_ISCHR(st2.st_mode) &&
+							(st2.st_rdev == me.st_rdev) )
+						{
+							string comm;
+							if(FILE* fp = fopen((string("/proc/") + e->d_name + "/comm").c_str(), "r"))
+							{
+								char c[64] = {0};
+								if(fgets(c, sizeof(c), fp))
+									comm = c;
+								fclose(fp);
+								if(!comm.empty() && comm.back() == '\n')
+									comm.pop_back();
+							}
+							ret += "; also open in PID " + string(e->d_name) + " (" + comm + ")";
+							break;
+						}
+					}
+					closedir(fds);
+				}
+			}
+			closedir(proc);
+		}
+	}
+	return ret;
 }
 
 bool OscillSerial::SetBaudRate(unsigned int baud)
@@ -200,14 +289,22 @@ size_t OscillSerial::Read(uint8_t* buf, size_t len, int timeoutMs)
 	return pos;
 }
 
-void OscillSerial::Drain(int quietMs)
+size_t OscillSerial::Drain(int quietMs)
 {
 	if(m_fd < 0)
-		return;
+		return 0;
+	int inq = 0;
+	ioctl(m_fd, TIOCINQ, &inq);
 	tcflush(m_fd, TCIFLUSH);
+	size_t total = (inq > 0) ? inq : 0;
 	uint8_t junk[256];
-	while(Read(junk, sizeof(junk), quietMs) > 0)
-	{}
+	size_t n;
+	while( (n = Read(junk, sizeof(junk), quietMs)) > 0)
+	{
+		LogTrace("Oscill: drained %s\n", oscill::HexDump(oscill::Bytes(junk, junk + n)).c_str());
+		total += n;
+	}
+	return total;
 }
 
 /**
