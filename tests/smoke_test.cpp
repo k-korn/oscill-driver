@@ -257,8 +257,8 @@ int main(int argc, char** argv)
 
 	if( (argc > 3) && (string(argv[3]) == "filters") )
 	{
-		//Needs a spiky signal on the tip. The high-pass ("Filt H") turns sharp edges into decaying tails and removes
-		//slow content; the 3 MHz low-pass ("Filt L") has no visible effect at 200 kS/s.
+		//Needs a spiky signal on the tip. The ~3 kHz low-pass smears sharp edges into slow ramps (and divides down a
+		//high-impedance source); the 3 MHz low-pass has no visible effect at 200 kS/s.
 		LogNotice("--- input filters via ADC mode (spiky signal on the tip) ---\n");
 		scope->SetChannelCoupling(0, OscilloscopeChannel::COUPLE_DC_1M);
 		scope->SetChannelVoltageRange(0, 0, 1.6);	//0.2 V/div

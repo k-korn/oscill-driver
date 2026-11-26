@@ -14,9 +14,9 @@ Verified with ngscopeclient (scopehal-apps 0.3) and a real probe:
 
 * identification, register access, link speed up to 921600 baud;
 * volts/div 20 mV–10 V, sample rates 100 S/s–25 MS/s (volt and time scales checked within 1%);
-* DC / AC / GND coupling, the probe's ~3 MHz low-pass ("Filt L") and ~3 kHz high-pass ("Filt H") as ADC modes;
-* Run / Single / Auto / Force / Stop with a **software edge trigger** (rising, falling, either; level and position):
-  the probe's hardware trigger has no effect on this firmware.
+* DC / AC / GND coupling, the probe's ~3 MHz and ~3 kHz low-pass filters as ADC modes (3 MHz also as the bandwidth limit);
+* Run / Single / Auto / Force / Stop with the probe's **hardware edge trigger** (rising, falling, either; level and
+  position), refined to sub-sample alignment in software.
 
 Records are `QS` − 2 samples (252 with the power-up setting). Not supported: the probe's averaging / peak modes, RIS, ROLL, record length changes.
 

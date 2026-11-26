@@ -40,16 +40,19 @@ static const uint8_t O1_GROUND		= 0x01;
 static const uint8_t O1_AC			= 0x02;
 static const uint8_t O1_COUPLING	= O1_GROUND | O1_AC;
 
-//Input filters: the vendor app's "Filt L" / "Filt H" buttons = low-pass / high-pass.
-//Bit 3 is a HIGH-pass (~3 kHz): a 500 mV 50 Hz signal dropped to ~5 mV (first-order 3 kHz: 1.7 %), while fast spike
-//edges passed and decayed into tails. Bit 2 is presumably the ~3 MHz LOW-pass: no visible effect at <= 200 kS/s.
-static const uint8_t O1_LOWPASS_3MHZ	= 0x04;		//"Filt L"
-static const uint8_t O1_HIGHPASS_3KHZ	= 0x08;		//"Filt H"
-static const uint8_t O1_FILTERS			= O1_LOWPASS_3MHZ | O1_HIGHPASS_3KHZ;
+//Input filters: two low-pass filters (vendor document: bit 2 = 3 MHz, bit 3 = 3 kHz "up to 200 mV/div").
+//Battery test: neither blocks DC (1.348 V read 1.33..1.37 V with each). Step test at 1 MS/s, 200 mV/div: with bit 2
+//a step still rises within 1..2 samples; with bit 3 it ramps at ~1 code/us (10-90 % in 40..90 us), corner roughly
+//0.5..3 kHz. With a high-impedance source (a wire picking up mains) the slow filter's input capacitance divides the
+//signal down: 500 mV of 50 Hz pickup became ~5 mV. Bit 2 also adds ~+40 mV of offset at 0.5 V/div.
+static const uint8_t O1_LOWPASS_3MHZ	= 0x04;
+static const uint8_t O1_LOWPASS_3KHZ	= 0x08;
+static const uint8_t O1_FILTERS			= O1_LOWPASS_3MHZ | O1_LOWPASS_3KHZ;
 
-//Shown by ngscopeclient as ADC modes. Only the low-pass maps to the bandwidth-limit API.
-enum FilterMode { FILTER_NONE = 0, FILTER_LOWPASS = 1, FILTER_HIGHPASS = 2, FILTER_BANDPASS = 3 };
-static const uint8_t g_filterBits[] = { 0, O1_LOWPASS_3MHZ, O1_HIGHPASS_3KHZ, O1_LOWPASS_3MHZ | O1_HIGHPASS_3KHZ };
+//Shown by ngscopeclient as ADC modes; the 3 MHz filter is also the bandwidth limit. Both bits together behave like
+//the 3 kHz filter alone, so that combination is not offered (and is shown as the 3 kHz mode if found set).
+enum FilterMode { FILTER_NONE = 0, FILTER_LP_3MHZ = 1, FILTER_LP_3KHZ = 2 };
+static const uint8_t g_filterBits[] = { 0, O1_LOWPASS_3MHZ, O1_LOWPASS_3KHZ };
 
 //The 2 bytes after the attributes are the record size field (garbage on fw 1.26), not samples
 static const size_t JUNK_SAMPLES = 2;
@@ -926,15 +929,12 @@ unsigned int OscillOscilloscope::GetChannelBandwidthLimit(size_t /*i*/)
 	return (m_o1 & O1_LOWPASS_3MHZ) ? 3 : 0;
 }
 
-//Toggles only the low-pass; the high-pass (ADC mode) is left as it is
+//Selects the 3 MHz filter or none. Any limit below 1 MHz can't be expressed here (the API is in whole MHz): the
+//3 kHz filter is an ADC mode only.
 void OscillOscilloscope::SetChannelBandwidthLimit(size_t /*i*/, unsigned int limit_mhz)
 {
 	lock_guard<recursive_mutex> lock(m_mutex);
-	bool hp = (m_o1 & O1_HIGHPASS_3KHZ) != 0;
-	if(limit_mhz == 0)
-		PushFilter(hp ? FILTER_HIGHPASS : FILTER_NONE);
-	else
-		PushFilter(hp ? FILTER_BANDPASS : FILTER_LOWPASS);
+	PushFilter( (limit_mhz == 0) ? FILTER_NONE : FILTER_LP_3MHZ );
 }
 
 bool OscillOscilloscope::IsADCModeConfigurable()
@@ -949,26 +949,22 @@ bool OscillOscilloscope::IsADCModePerChannel()
 
 vector<string> OscillOscilloscope::GetADCModeNames(size_t /*channel*/)
 {
-	return { "Full bandwidth", "Low-pass ~3 MHz (Filt L)", "High-pass ~3 kHz (Filt H)", "Band-pass (Filt L + Filt H)" };
+	return { "Full bandwidth", "Low-pass ~3 MHz", "Low-pass ~3 kHz" };
 }
 
 size_t OscillOscilloscope::GetADCMode(size_t /*channel*/)
 {
-	bool lp = (m_o1 & O1_LOWPASS_3MHZ) != 0;
-	bool hp = (m_o1 & O1_HIGHPASS_3KHZ) != 0;
-	if(lp && hp)
-		return FILTER_BANDPASS;
-	if(hp)
-		return FILTER_HIGHPASS;
-	if(lp)
-		return FILTER_LOWPASS;
+	if(m_o1 & O1_LOWPASS_3KHZ)
+		return FILTER_LP_3KHZ;
+	if(m_o1 & O1_LOWPASS_3MHZ)
+		return FILTER_LP_3MHZ;
 	return FILTER_NONE;
 }
 
 void OscillOscilloscope::SetADCMode(size_t /*channel*/, size_t mode)
 {
 	lock_guard<recursive_mutex> lock(m_mutex);
-	if(mode <= FILTER_BANDPASS)
+	if(mode <= FILTER_LP_3KHZ)
 		PushFilter(mode);
 }
 
