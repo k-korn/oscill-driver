@@ -67,7 +67,7 @@ static Bytes NameHeader(uint8_t headerId, const string& name)
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Frame construction
 //
-// Layouts below come from oscilink.dll v1.04.0003 and are verified on hardware (see docs/Protocol.md).
+// Layouts follow the vendor's protocol document and are verified on hardware (see docs/Protocol.md).
 
 Bytes BuildConnect(uint16_t maxPacket)
 {
@@ -75,26 +75,36 @@ Bytes BuildConnect(uint16_t maxPacket)
 	return Bytes{ OP_CONNECT, 0x00, 0x07, 0x10, 0x00, (uint8_t)(maxPacket >> 8), (uint8_t)(maxPacket & 0xff) };
 }
 
+/**
+	@brief Single command in an 'r' header: 'D' (digitize) is a GET, 'C' (calibrate) a PUT, per the vendor document
+ */
 Bytes BuildCommand(char cmd)
 {
-	return BuildPacket(OP_GET, BuildHeader(HDR_COMMAND, Bytes{ (uint8_t)cmd }));
+	uint8_t op = (cmd == CMD_CALIBRATE) ? OP_PUT : OP_GET;
+	return BuildPacket(op, BuildHeader(HDR_COMMAND, Bytes{ (uint8_t)cmd }));
 }
 
-//oscilink.dll sends register reads with the PUT opcode
-Bytes BuildRegisterRead(const string& name)
+Bytes BuildAbort()
 {
-	return BuildPacket(OP_PUT, NameHeader(HDR_REG_READ, name));
+	return Bytes{ OP_ABORT, 0x00, 0x03 };
 }
 
 /**
-	@brief Reads a settings (2-letter, read/write) register: PUT with a name-only 'q' header.
+	@brief Reads a read-only property (3-letter name): GET with a 'p' header.
+	Verified: 83 00 09 70 00 06 'MCl' -> A0 00 0E 70 00 06 'MCl' F0 00 00 03 20
+ */
+Bytes BuildRegisterRead(const string& name)
+{
+	return BuildPacket(OP_GET, NameHeader(HDR_REG_READ, name));
+}
 
-	Confirmed on hardware (fw 1.26): 83 00 08 71 00 05 'RT' -> A0 00 0A 71 00 05 'RT' B1 00. The 'p' read only works
-	for the 3-letter read-only registers (MCl, TMh, VNM, ...).
+/**
+	@brief Reads a settings register (2-letter name): GET with a name-only 'q' header.
+	Verified: 83 00 08 71 00 05 'RT' -> A0 00 0A 71 00 05 'RT' B1 00
  */
 Bytes BuildRegisterQuery(const string& name)
 {
-	return BuildPacket(OP_PUT, NameHeader(HDR_REG_WRITE, name));
+	return BuildPacket(OP_GET, NameHeader(HDR_REG_WRITE, name));
 }
 
 Bytes BuildRegisterWrite1(const string& name, uint8_t value)
@@ -193,51 +203,6 @@ bool ParseWaveform(const Bytes& frame, WaveformFrame& out)
 	out.metadata.assign(frame.begin() + pos, frame.begin() + pos + WAVEFORM_METADATA_LEN);
 	out.samples.assign(frame.begin() + pos + WAVEFORM_METADATA_LEN, frame.end());
 	return true;
-}
-
-/**
-	@brief Extracts the printable ID string from an 'F' reply.
-
-	Tolerates the string being raw after the 'r' header, or wrapped in another OBEX string / byte-sequence header.
- */
-string ParseFirmwareString(const Bytes& frame)
-{
-	if(!IsSuccess(frame))
-		return "";
-
-	size_t pos = 3;
-
-	//Skip an echoed 'r' header if present
-	if( (frame.size() >= pos + 3) && (frame[pos] == HDR_COMMAND) )
-	{
-		size_t hlen = ((size_t)frame[pos+1] << 8) | frame[pos+2];
-		if(hlen >= 3 && pos + hlen <= frame.size())
-			pos += hlen;
-	}
-
-	//Unwrap a nested string/byte-sequence header if the length matches exactly
-	if( (frame.size() >= pos + 3) && (frame[pos] < 0x80) )
-	{
-		size_t hlen = ((size_t)frame[pos+1] << 8) | frame[pos+2];
-		if(hlen >= 3 && pos + hlen == frame.size())
-			pos += 3;
-	}
-
-	string s;
-	for(size_t i=pos; i<frame.size(); i++)
-	{
-		uint8_t c = frame[i];
-		if(c >= 0x20 && c < 0x7f)
-			s += (char)c;
-		else if(c == 0 && !s.empty())
-			break;
-	}
-
-	//Trim
-	while(!s.empty() && s.back() == ' ')
-		s.pop_back();
-	size_t first = s.find_first_not_of(' ');
-	return (first == string::npos) ? "" : s.substr(first);
 }
 
 /**

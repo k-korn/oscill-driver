@@ -19,17 +19,19 @@ namespace oscill
 
 typedef std::vector<uint8_t> Bytes;
 
-//OBEX opcodes used by the probe
+//OBEX opcodes (standard OBEX numbering; Oscill extensions per the vendor's protocol document)
 enum Opcode : uint8_t
 {
 	OP_CONNECT		= 0x80,
-	OP_GET			= 0x82,
-	OP_GET_CONT		= 0x02,
-	OP_PUT			= 0x83,
-	OP_SET_SPEED	= 0x91,		//body: one byte = 1843200 / baud (from oscilink.dll)
-	OP_ABORT		= 0x92,
-	OP_SUCCESS		= 0xA0,
-	OP_ERROR		= 0xD0
+	OP_DISCONNECT	= 0x81,
+	OP_PUT			= 0x82,		//final PUT: register writes, 'C' (calibrate)
+	OP_GET			= 0x83,		//final GET: property / register reads, 'D' (digitize)
+	OP_SET_SPEED	= 0x91,		//Oscill extension: body = one byte, 1843200 / baud
+	OP_REPEAT		= 0x92,		//Oscill extension: repeat the last response
+	OP_ABORT		= 0xFF,		//stop the current operation (e.g. a roll-mode stream)
+	OP_CONTINUE		= 0x90,		//response: part of a longer reply
+	OP_SUCCESS		= 0xA0,		//response
+	OP_ERROR		= 0xD0		//response: internal server error (e.g. corrupted request)
 };
 
 //Oscill-specific header IDs
@@ -57,9 +59,9 @@ enum TypeMarker : uint8_t
 //Core commands carried in the 'r' header
 enum Command : char
 {
-	CMD_DATA		= 'D',		//fetch a waveform; the reply comes when a fresh record has been acquired
-	CMD_FIRMWARE	= 'F',		//firmware / ID string (rejected by the oscilloscope firmware 1.26)
-	CMD_CANCEL		= 'C'		//cancel / reset acquisition
+	CMD_DATA		= 'D',		//digitize (GET): the reply comes when a fresh record has been acquired
+	CMD_CALIBRATE	= 'C'		//self-calibration of zero and trigger level (PUT)
+	//'F' is the vendor's firmware-load command: never sent by this driver
 };
 
 //OBEX End-of-Body header: carries the waveform data
@@ -104,6 +106,7 @@ struct WaveformFrame
 //Frame construction
 Bytes BuildConnect(uint16_t maxPacket = 0x1000);
 Bytes BuildCommand(char cmd);
+Bytes BuildAbort();
 Bytes BuildRegisterRead(const std::string& name);
 Bytes BuildRegisterQuery(const std::string& name);
 Bytes BuildRegisterWrite1(const std::string& name, uint8_t value);
@@ -120,7 +123,6 @@ bool IsCommandReply(const Bytes& frame, char cmd);
 
 //Frame decoding
 bool ParseWaveform(const Bytes& frame, WaveformFrame& out);
-std::string ParseFirmwareString(const Bytes& frame);
 bool ParseRegisterReply(const Bytes& frame, const std::string& name, RegValue& out);
 
 std::string HexDump(const Bytes& b, size_t maxBytes = 64);

@@ -5,9 +5,9 @@ Oscill DSO1 probe simulator on a pseudo-terminal, for testing the ngscopeclient 
     python3 tools/oscill_sim.py            # prints the pty path, e.g. /dev/pts/5
     ngscopeclient  ->  driver "oscill", transport "uart", path "/dev/pts/5:9600"
 
-Implements the frames documented in docs/Protocol.md: CONNECT, GET 'D' / 'F' / 'C', register PUT 'q' and
-GET 'p'. In Normal trigger mode (RT=2) it holds the 'D' reply for --trigger-delay seconds, like a real probe
-waiting for a trigger, so cancel handling gets exercised.
+Implements the frames documented in docs/Protocol.md: CONNECT, Abort, GET 'D' (digitize), PUT 'C' (calibrate),
+'p' property reads, 'q' register reads and writes, speed change. Like the real probe it answers 'D' one record
+duration after the request. It does not simulate the hardware trigger.
 """
 
 import argparse
@@ -94,10 +94,8 @@ class Probe:
             return
         if len(pkt) >= 7 and pkt[3] == 0x72:
             cmd = chr(pkt[6])
-            if cmd == "F":
-                # the real oscilloscope firmware (1.26) rejects GET 'F'
-                self.send(frame(0xD0))
-            elif cmd == "C":
+            if cmd == "C":
+                # calibration
                 self.pending_d_at = None
                 self.send(bytes.fromhex("A0 00 03"))
             elif cmd == "D":
@@ -107,10 +105,16 @@ class Probe:
             return
         if self.args.silent:
             return
-        if op == 0x83 and self.args.reject_writes:
+        if op == 0xFF:
+            # Abort: stop a pending digitization
+            self.pending_d_at = None
+            self.send(frame(0xA0))
+            return
+        if op in (0x82, 0x83) and self.args.reject_writes and len(pkt) > 6 and pkt[3] == 0x71 and \
+                len(pkt) > 3 + struct.unpack(">H", pkt[4:6])[0]:
             self.send(frame(0xD0))
             return
-        if op == 0x83 and len(pkt) >= 6 and pkt[3] == 0x71:
+        if op in (0x82, 0x83) and len(pkt) >= 6 and pkt[3] == 0x71:
             # 71 LL LL name, then value header: B1 v | F0 00 00 hi lo | F1 b3..b0
             hl = struct.unpack(">H", pkt[4:6])[0]
             name = pkt[6:3 + hl].decode(errors="replace")
@@ -135,7 +139,10 @@ class Probe:
                 if name == "TS" and self.regs["TS"] < 65536:
                     self.regs["TS"] -= self.regs["TS"] % 256     # real probe: whole clocks at fast rates
                 print(f"set {name} = {self.regs[name]}", flush=True)
-                self.send(frame(0xA0, pkt[3:3 + hl] + self.value_header(name)))   # echo of the applied value
+                if op == 0x82:
+                    self.send(frame(0xA0))      # real probe: PUT write -> bare A0 00 03
+                else:
+                    self.send(frame(0xA0, pkt[3:3 + hl] + self.value_header(name)))   # GET write: echo
                 return
             self.send(frame(0xD0))
             return

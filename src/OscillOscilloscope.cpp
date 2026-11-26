@@ -22,11 +22,11 @@ using namespace oscill;
 // and verified on hardware where noted (see docs/Protocol.md). Items marked GUESS have not been confirmed.
 //   1 byte: O1 M1 T1 S1 RT AP AR RS   2 bytes: MC V1 QS TC   4 bytes: TS TD TA TW
 
-//Neutral state written once at connect. The hardware trigger has no effect on fw 1.26 (triggering is done in
-//software), so the probe is kept in free run (RT = 0, verified), plain sampling (M1 = 0, the power-up value; the
-//vendor app may leave Average / Peak selected), no pre-trigger count and no delay.
-static const uint8_t RT_FREE_RUN	= 0;
-static const uint8_t M1_SAMPLE		= 0;
+//Neutral state written once at connect (vendor document): the driver triggers in software, so the probe runs in
+//free run (RT = 2; 0 is Auto, 1 Wait, 3 Wait forever) with normal sampling (M1 = 4: one ADC sample per output
+//sample; 0 is averaging, the power-up value), no pre-trigger count and no delay.
+static const uint8_t RT_FREE_RUN	= 2;
+static const uint8_t M1_NORMAL		= 4;
 
 //O1 = input option bits (oscill.exe 0x4b4f50).
 //Confirmed with a 1.36 V battery at 0.5 V/div: O1=0 reads 214 (DC), O1=2 reads 128 (DC blocked, AC signals still pass:
@@ -215,7 +215,9 @@ bool OscillOscilloscope::Connect()
 
 		for(int retry = 0; retry < 2 && !ok; retry++)
 		{
-			m_port.Drain();
+			//Abort first: stops anything a previous session left running (e.g. a roll-mode stream)
+			SendFrame(BuildAbort());
+			m_port.Drain(100);
 			m_rxBuf.clear();
 			if(!SendFrame(BuildConnect()))
 				return false;
@@ -240,13 +242,12 @@ bool OscillOscilloscope::Connect()
 	if(wantedBaud != m_port.GetBaudRate())
 		ChangeBaudRate(wantedBaud);
 
-	//GET 'C' resets the acquisition engine. Confirmed on hardware: without it, GET 'D' kept returning a stale
-	//buffer (all 255) that ignored every setting; after one 'C' the samples follow the input.
-	if(!Transact(BuildCommand(CMD_CANCEL), reply))
-		LogWarning("Oscill: no reply to the initial cancel\n");
+	//Self-calibration (PUT 'C': zero and trigger level). Seen on hardware: without it, GET 'D' kept returning a
+	//stale buffer (all 255) that ignored every setting.
+	if(!Transact(BuildCommand(CMD_CALIBRATE), reply))
+		LogWarning("Oscill: no reply to the calibration command\n");
 
-	//Identity registers: 4 ASCII characters each (confirmed on hardware: VNM "Uosc", VSN "3404", VHW "1.25",
-	//VSW "1.26"). GET 'F' is only answered in some states (probably by the bootloader), so it isn't used.
+	//Identity registers: 4 ASCII characters each (verified: VNM "Uosc", VSN "3404", VHW "1.25", VSW "1.26")
 	RegValue v;
 	string hw;
 	if(ReadRegister("VNM", v))
@@ -462,11 +463,12 @@ bool OscillOscilloscope::WriteRegister(const string& name, const Bytes& request,
 	//Any frame we were holding was captured with the old settings
 	m_frameReady = false;
 
-	//The reply echoes the value the probe actually applied (e.g. TS 514 -> 512, MC 1991 -> 1982)
+	//A PUT write is acknowledged with a bare A0 00 03. The probe may apply a different value than requested
+	//(e.g. TS 514 -> 512), so read it back when the caller needs it (as the vendor document recommends).
 	Bytes reply;
 	if(Transact(request, reply) && IsSuccess(reply))
 	{
-		if(applied && !ParseRegisterReply(reply, name, *applied))
+		if(applied && !ParseRegisterReply(reply, name, *applied) && !ReadRegister(name, *applied))
 			applied->kind = RegValue::NONE;
 		return true;
 	}
@@ -500,9 +502,9 @@ bool OscillOscilloscope::WriteReg4(const string& name, uint32_t value)
 	@brief Ends an outstanding GET 'D' before another request is sent.
 
 	Verified on hardware: a 'D' reply comes one record duration after the request (0.26 s at 1 kS/s, 5.1 s at
-	50 S/s), and while acquiring the probe does not process commands (GET 'C' sent during a 5 s record got no ACK and
-	desynchronised everything after it). Sending while it transmits makes it restart the reply. So the only safe way
-	to end a request is to wait for its reply; GET 'C' is a fallback if the reply never comes.
+	50 S/s), and digitizing is non-interruptible (vendor document; a command sent during a 5 s record got no reply and
+	desynchronised the link). Sending while it transmits makes it restart the reply. So the only safe way to end a
+	request is to wait for its reply; Abort is a fallback if the reply never comes.
  */
 void OscillOscilloscope::CancelPendingAcquisition()
 {
@@ -524,24 +526,9 @@ void OscillOscilloscope::CancelPendingAcquisition()
 		return;
 	}
 
-	LogWarning("Oscill: waveform request not answered in time, cancelling\n");
-	if(!SendFrame(BuildCommand(CMD_CANCEL)))
-		return;
-
-	//Expect the ACK (A0 00 03). A record finished at the same moment may arrive first: skip it.
-	deadline = GetTime() + 1.0;
-	while(true)
-	{
-		int remaining = (int)((deadline - GetTime()) * 1e3);
-		if(remaining <= 0 || !ReadFrame(f, remaining))
-		{
-			LogWarning("Oscill: no ACK for cancel, flushing\n");
-			Resync();
-			return;
-		}
-		if(!IsCommandReply(f, CMD_DATA))
-			break;
-	}
+	LogWarning("Oscill: waveform request not answered in time, aborting\n");
+	SendFrame(BuildAbort());
+	m_port.Drain(100);			//discard the abort reply and anything that was still on its way
 	m_rxBuf.clear();
 }
 
@@ -583,7 +570,7 @@ void OscillOscilloscope::PushAll()
 	//Neutral acquisition state (see RT_FREE_RUN). TC / TD don't change what the probe returns in free run, but
 	//zero is the harmless value for a pre-trigger count and a delay.
 	WriteReg1("RT", RT_FREE_RUN);
-	WriteReg1("M1", M1_SAMPLE);
+	WriteReg1("M1", M1_NORMAL);
 	WriteReg2("TC", 0);
 	WriteReg4("TD", 0);
 

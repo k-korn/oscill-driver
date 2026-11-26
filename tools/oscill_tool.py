@@ -85,7 +85,14 @@ class Link:
         self.send(data)
         return self.recv(timeout)
 
+    def abort(self):
+        # OBEX Abort: stops whatever a previous session left running (e.g. a roll-mode stream)
+        self.send(bytes.fromhex("ff 00 03"))
+        time.sleep(0.1)
+        self.s.reset_input_buffer()
+
     def connect(self):
+        self.abort()
         r = self.xfer(bytes.fromhex("80 00 07 10 00 10 00"))
         if not r or r[0] != 0xA0:
             # opening the port can glitch the modem lines and briefly restart the probe: retry once
@@ -100,15 +107,20 @@ class Link:
         return r
 
     def cmd(self, c, timeout=1.5):
-        return self.xfer(packet(0x82, header(0x72, c.encode())), timeout)
+        # vendor document: 'D' (digitize) is a GET (0x83), 'C' (calibrate) a PUT (0x82).
+        # 'F' is the firmware-load command: never send it.
+        assert c in ("D", "C")
+        op = 0x82 if c == "C" else 0x83
+        return self.xfer(packet(op, header(0x72, c.encode())), timeout)
 
     def read_reg(self, name):
         # 3-letter names are read-only constants ('p' read); 2-letter names are settings, read with a name-only 'q'
         hid = 0x70 if len(name) >= 3 else 0x71
         return self.xfer(packet(0x83, header(hid, name.encode())))
 
-    def cancel(self):
-        # GET 'C' resets the acquisition; without it a freshly connected probe returned a stale all-255 buffer
+    def calibrate(self):
+        # PUT 'C': self-calibration of zero and trigger level. Without it a freshly connected probe returned a
+        # stale all-255 buffer.
         return self.cmd("C")
 
     def write_reg(self, name, typ, value):
@@ -118,11 +130,11 @@ class Link:
             v = struct.pack(">I", value & 0xffff)
         else:
             v = struct.pack(">I", value & 0xffffffff)
-        return self.xfer(packet(0x83, header(0x71, name.encode()) + bytes([MARKERS[typ]]) + v))
+        return self.xfer(packet(0x82, header(0x71, name.encode()) + bytes([MARKERS[typ]]) + v))
 
     def set_speed(self, baud):
-        """Switch the link speed. The probe ACKs at the NEW rate, so the reply is not read; verify with
-        verify_link() afterwards."""
+        """Switch the link speed. The probe ACKs at the old rate (0f 00 04 <coef>) and then switches; the ACK
+        is discarded. Verify with verify_link() afterwards."""
         self.send(packet(0x91, bytes([1843200 // baud])))
         self.s.flush()
         time.sleep(0.05)
@@ -130,14 +142,14 @@ class Link:
         self.s.reset_input_buffer()
 
     def verify_link(self):
-        """CONNECT is always answered (GET 'F' is rejected by fw 1.26)."""
+        """CONNECT is always answered."""
         r = self.xfer(bytes.fromhex("80 00 07 10 00 10 00"), 0.5)
         return bool(r and r[0] == 0xA0)
 
     def capture(self, timeout=5.0):
         r = self.cmd("D", timeout)
         if not r:
-            self.cmd("C")
+            self.abort()
             return None
         if len(r) < 15 or r[0] != 0xA0:
             print("unexpected:", hexs(r))
@@ -145,7 +157,7 @@ class Link:
         hl = struct.unpack(">H", r[4:6])[0]
         body = r[3 + hl:]
         if len(body) <= 7:
-            return "empty"      # 49 00 03: nothing triggered yet (Auto/Normal mode)
+            return "empty"      # 49 00 03: Wait mode (RT=1) timed out without a trigger
         return body[:7], body[7:]
 
 
@@ -191,7 +203,7 @@ def main():
     c.add_argument("--count", type=int, default=1)
     c.add_argument("--csv")
     c.add_argument("--timeout", type=float, default=5.0)
-    c.add_argument("--no-cancel", action="store_true", help="don't send GET 'C' before the first capture")
+    c.add_argument("--no-calibrate", action="store_true", help="don't send PUT 'C' (calibrate) before the first capture")
     sw = sub.add_parser("sweep")
     sw.add_argument("reg")
     sw.add_argument("start", type=int)
@@ -208,8 +220,6 @@ def main():
     link.connect()
 
     if args.cmd == "id":
-        r = link.cmd("F")
-        print("F:", r[3:].decode(errors="replace") if r else "no reply", f"[{hexs(r) if r else ''}]")
         for name in ("VNM", "VSN", "VHW", "VSW", "MCl", "MCh", "MCd"):
             print(f"{name}: {decode_value(name, link.read_reg(name))}")
     elif args.cmd == "read":
@@ -221,8 +231,8 @@ def main():
         print("reply:", hexs(r) if r else "none", "(OK)" if r and r[0] == 0xA0 else "")
     elif args.cmd == "capture":
         rows = []
-        if not args.no_cancel:
-            link.cancel()
+        if not args.no_calibrate:
+            link.calibrate()
         for i in range(args.count):
             deadline = time.time() + args.timeout
             res = link.capture(args.timeout)
@@ -233,7 +243,7 @@ def main():
                 print(f"#{i}: no trigger within {args.timeout} s")
                 continue
             if not res:
-                print(f"#{i}: no waveform (timeout, sent cancel)")
+                print(f"#{i}: no waveform (timeout, sent abort)")
                 continue
             meta, samples = res
             print(f"#{i}: meta [{meta.hex(' ')}]  n={len(samples)} min={min(samples)} max={max(samples)} "
@@ -246,11 +256,11 @@ def main():
                     f.write(f"{k}," + ",".join(str(r[k]) if k < len(r) else "" for r in rows) + "\n")
             print("wrote", args.csv)
     elif args.cmd == "sweep":
+        link.calibrate()
         for v in range(args.start, args.stop + 1):
             typ = REG_TYPE.get(args.reg, "u32") if args.type == "auto" else args.type
             wr = link.write_reg(args.reg, typ, v)
             ok = "ok " if wr and wr[0] == 0xA0 else "ERR"
-            link.cancel()
             res = link.capture()
             if res and res != "empty":
                 meta, s = res
