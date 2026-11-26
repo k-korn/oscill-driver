@@ -22,10 +22,15 @@ using namespace oscill;
 // and verified on hardware where noted (see docs/Protocol.md). Items marked GUESS have not been confirmed.
 //   1 byte: O1 M1 T1 S1 RT AP AR RS   2 bytes: MC V1 QS TC   4 bytes: TS TD TA TW
 
-//Neutral state written once at connect (vendor document): the driver triggers in software, so the probe runs in
-//free run (RT = 2; 0 is Auto, 1 Wait, 3 Wait forever) with normal sampling (M1 = 4: one ADC sample per output
-//sample; 0 is averaging, the power-up value), no pre-trigger count and no delay.
+//Run mode (RT, vendor document; verified on hardware): 0 Auto (record after TA without a trigger), 1 Wait (empty
+//reply after TW without a trigger), 2 free run, 3 wait forever (not used: a request could then never end on its own).
+//Normal / Single use Wait, Auto uses Auto, Force uses free run.
+static const uint8_t RT_AUTO		= 0;
+static const uint8_t RT_WAIT		= 1;
 static const uint8_t RT_FREE_RUN	= 2;
+static const uint8_t RT_UNKNOWN		= 0xFF;
+
+//Normal sampling (M1 = 4: one ADC sample per output sample; 0 is averaging, the power-up value)
 static const uint8_t M1_NORMAL		= 4;
 
 //O1 = input option bits (oscill.exe 0x4b4f50).
@@ -46,8 +51,24 @@ static const uint8_t O1_FILTERS			= O1_LOWPASS_3MHZ | O1_HIGHPASS_3KHZ;
 enum FilterMode { FILTER_NONE = 0, FILTER_LOWPASS = 1, FILTER_HIGHPASS = 2, FILTER_BANDPASS = 3 };
 static const uint8_t g_filterBits[] = { 0, O1_LOWPASS_3MHZ, O1_HIGHPASS_3KHZ, O1_LOWPASS_3MHZ | O1_HIGHPASS_3KHZ };
 
-//Software trigger (the hardware trigger does not gate captures on fw 1.26; see docs/Protocol.md)
-static const size_t JUNK_SAMPLES = 2;			//first samples of every record are garbage (~250, ~66)
+//The 2 bytes after the attributes are the record size field (garbage on fw 1.26), not samples
+static const size_t JUNK_SAMPLES = 2;
+
+//Hardware trigger. T1: bit 5 rising, bit 4 falling, bits 3-0 = hysteresis on (11 11), bits 7-6 = 00 (HF + LF).
+//S1 = level in ADC codes; TC = pre-trigger samples (<= TCh); TA / TW = Auto / Wait timeouts in units of 12 MCU clocks.
+static const uint8_t T1_RISING		= 0x20;
+static const uint8_t T1_FALLING		= 0x10;
+static const uint8_t T1_HYSTERESIS	= 0x0F;
+static const uint32_t DEFAULT_TC_MAX	= 252;		//TCh at the power-up rate (1787 at <= 1 MS/s)
+static const double HW_WAIT_S		= 0.25;		//Normal / Single: one request waits this long for a trigger. Short,
+												//since a request can't be interrupted (settings changes wait for it)
+static const double HW_AUTO_S		= 0.1;		//Auto: deliver an untriggered record after this long
+//Measured (48 captures, TC 50 / 127 / 200, both edges): the first sample past the level lands 0..4 samples before
+//TC, on average 2 (rising 1.4, falling 2.6); the interpolated crossing is half a sample earlier still
+static const double HW_TRIGGER_LAG_SAMPLES	= 2.5;
+static const double HW_TRIGGER_SEARCH_SAMPLES	= 4;	//refine within this distance of the expected crossing
+
+//Software edge search (sub-sample alignment of hardware triggers; edge search in Auto / Force records)
 static const double SW_TRIGGER_HYST_CODES = 3;	//noise is about +-2..3 codes
 
 //Vertical scale. V1 = volts/div in millivolts (oscill.exe: V1 = range * 1000 / 8, 8 divisions full screen).
@@ -105,6 +126,9 @@ OscillOscilloscope::OscillOscilloscope(SCPITransport* transport)
 	, m_swTrigLevel(0)
 	, m_swTrigEdges(EDGE_RISING_BIT)
 	, m_lastDepth(DEFAULT_RECORD_LEN - JUNK_SAMPLES)
+	, m_rt(RT_UNKNOWN)
+	, m_tc(0)
+	, m_tcMax(DEFAULT_TC_MAX)
 	, m_regWriteFailures(0)
 {
 	m_vendor = "OKB ROSA";
@@ -513,7 +537,7 @@ void OscillOscilloscope::CancelPendingAcquisition()
 	m_requestOutstanding = false;
 
 	Bytes f;
-	double deadline = m_requestTime + GetRecordSeconds() + CANCEL_MARGIN_S;
+	double deadline = m_requestTime + GetRequestSeconds() + CANCEL_MARGIN_S;
 	while(true)
 	{
 		int remaining = max(1, (int)((deadline - GetTime()) * 1e3));
@@ -567,16 +591,87 @@ bool OscillOscilloscope::EnsureConnected()
 
 void OscillOscilloscope::PushAll()
 {
-	//Neutral acquisition state (see RT_FREE_RUN). TC / TD don't change what the probe returns in free run, but
-	//zero is the harmless value for a pre-trigger count and a delay.
-	WriteReg1("RT", RT_FREE_RUN);
+	//Free run until armed (RT is then set per trigger mode), normal sampling, no trigger delay
+	m_rt = RT_UNKNOWN;
+	SetRunMode(RT_FREE_RUN);
 	WriteReg1("M1", M1_NORMAL);
-	WriteReg2("TC", 0);
 	WriteReg4("TD", 0);
 
 	PushCoupling();
 	PushVerticalRange();
 	PushTimebase();
+	PushTriggerRegisters();
+}
+
+/**
+	@brief Writes RT if it differs from what the probe has
+ */
+void OscillOscilloscope::SetRunMode(uint8_t rt)
+{
+	if(rt == m_rt)
+		return;
+	if(WriteReg1("RT", rt))
+		m_rt = rt;
+	else
+		m_rt = RT_UNKNOWN;
+}
+
+/**
+	@brief Run mode for the next request: free run for Force, Auto for auto trigger, else Wait
+ */
+uint8_t OscillOscilloscope::DesiredRunMode()
+{
+	if(m_forceNext)
+		return RT_FREE_RUN;
+	return m_autoMode ? RT_AUTO : RT_WAIT;
+}
+
+/**
+	@brief Converts seconds to TA / TW units (12 MCU clocks)
+ */
+uint32_t OscillOscilloscope::SecondsToTimerUnits(double s)
+{
+	double clockFs = (double)m_mc * MC_UNIT_FS;
+	return (uint32_t)max(1.0, round(s * FS_PER_SECOND / (12 * clockFs)));
+}
+
+/**
+	@brief Trigger level (S1), in ADC codes, from the cached level in volts
+ */
+void OscillOscilloscope::PushTriggerLevel()
+{
+	double code = g_adcZeroCode + m_swTrigLevel / GetVoltsPerCode();
+	WriteReg1("S1", (uint8_t)lround(min(254.0, max(1.0, code))));
+}
+
+/**
+	@brief Pre-trigger count (TC) from the trigger offset, and the timeouts (TA / TW), which scale with MC
+ */
+void OscillOscilloscope::PushTriggerPosition()
+{
+	double pos = (double)m_triggerOffset / GetSamplePeriodFs() + HW_TRIGGER_LAG_SAMPLES;
+	double maxTc = min((double)m_tcMax, (double)(m_lastDepth ? m_lastDepth - 1 : 0));
+	uint32_t tc = (uint32_t)lround(min(maxTc, max(0.0, pos)));
+	if(WriteReg2("TC", (uint16_t)tc))
+		m_tc = tc;
+
+	WriteReg4("TA", SecondsToTimerUnits(HW_AUTO_S));
+	WriteReg4("TW", SecondsToTimerUnits(HW_WAIT_S));
+}
+
+/**
+	@brief Writes all hardware trigger registers from the cached settings
+ */
+void OscillOscilloscope::PushTriggerRegisters()
+{
+	uint8_t t1 = T1_HYSTERESIS;
+	if(m_swTrigEdges & EDGE_RISING_BIT)
+		t1 |= T1_RISING;
+	if(m_swTrigEdges & EDGE_FALLING_BIT)
+		t1 |= T1_FALLING;
+	WriteReg1("T1", t1);
+	PushTriggerLevel();
+	PushTriggerPosition();
 }
 
 void OscillOscilloscope::PushCoupling()
@@ -592,8 +687,10 @@ void OscillOscilloscope::PushCoupling()
 
 void OscillOscilloscope::PushVerticalRange()
 {
-	//The software trigger level is kept in volts, so nothing else depends on the range
 	WriteReg2("V1", (uint16_t)lround(g_voltsPerDiv[m_vrangeIndex] * 1000));
+
+	//The trigger level is kept in volts: its code depends on the range
+	PushTriggerLevel();
 }
 
 /**
@@ -606,6 +703,9 @@ void OscillOscilloscope::PushTimebase()
 	if(WriteRegister("TS", BuildRegisterWrite4("TS", m_ts), &applied) && applied.IsNumeric() && applied.u > 0)
 		m_ts = applied.u;
 	ReadTimebaseState();
+
+	//TC is in samples and TA / TW in clocks
+	PushTriggerPosition();
 }
 
 /**
@@ -621,6 +721,10 @@ void OscillOscilloscope::ReadTimebaseState()
 		m_qs = v.u;
 		m_lastDepth = m_qs - JUNK_SAMPLES;
 	}
+
+	//The longest pre-trigger count depends on the rate (252 at 25 MS/s, 1787 at <= 1 MS/s)
+	if(ReadRegister("TCh", v) && v.IsNumeric() && v.u > 0)
+		m_tcMax = v.u;
 }
 
 /**
@@ -629,6 +733,21 @@ void OscillOscilloscope::ReadTimebaseState()
 double OscillOscilloscope::GetRecordSeconds()
 {
 	return (double)m_qs * GetSamplePeriodFs() / FS_PER_SECOND;
+}
+
+/**
+	@brief Longest time a GET 'D' can take in the current run mode: the record plus the trigger wait
+ */
+double OscillOscilloscope::GetRequestSeconds()
+{
+	double wait = 0;
+	if(m_rt == RT_WAIT)
+		wait = HW_WAIT_S;
+	else if(m_rt == RT_AUTO)
+		wait = HW_AUTO_S;
+	else if(m_rt == RT_UNKNOWN)
+		wait = max(HW_WAIT_S, HW_AUTO_S);
+	return 2 * GetRecordSeconds() + wait;	//pre-trigger part, then the rest of the record after the trigger
 }
 
 size_t OscillOscilloscope::NearestVoltRange(double voltsPerDiv)
@@ -743,8 +862,9 @@ void OscillOscilloscope::SetChannelAttenuation(size_t /*i*/, double atten)
 	if(atten <= 0)
 		return;
 
-	//Software only (scales the volt axis; the trigger level is in volts already)
+	//Scales the volt axis; the trigger level is in volts, so its code changes
 	m_attenuation = atten;
+	PushTriggerLevel();
 }
 
 vector<unsigned int> OscillOscilloscope::GetChannelBandwidthLimiters(size_t /*i*/)
@@ -876,10 +996,11 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 	if(m_frameReady)
 		return TRIGGER_MODE_TRIGGERED;
 
-	//Ask for the next record. The probe free-runs (triggering is done in software on each record) and answers one
-	//record duration later.
+	//Ask for the next record, in the run mode for the current trigger mode. The reply comes after the trigger (or
+	//the Auto / Wait timeout) plus the rest of the record.
 	if(!m_requestOutstanding)
 	{
+		SetRunMode(DesiredRunMode());
 		m_rxBuf.clear();
 		if(!SendFrame(BuildCommand(CMD_DATA)))
 			return TRIGGER_MODE_STOP;
@@ -890,7 +1011,7 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 	Bytes f;
 	if(ReadFrame(f, POLL_TIMEOUT_MS))
 	{
-		//An empty body (49 00 03) means "no record"; seen in RT = 1. Ask again on the next poll.
+		//An empty body (49 00 03): Wait mode timed out without a trigger. Ask again on the next poll.
 		WaveformFrame probe;
 		if(IsCommandReply(f, CMD_DATA) && !ParseWaveform(f, probe))
 		{
@@ -901,11 +1022,9 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 		{
 			m_requestOutstanding = false;
 
-			//Software trigger: Normal / Single only accept a record containing the selected edge; Auto shows
-			//records without one unaligned; Force accepts anything
-			bool found = ApplySoftwareTrigger(probe);
-			if(!found && !m_autoMode && !m_forceNext)
-				return TRIGGER_MODE_WAIT;
+			//The hardware decides what triggered (Wait mode only returns triggered records); the edge search
+			//only refines the alignment
+			AlignTrigger(probe);
 
 			m_frame.swap(f);
 			m_frameReady = true;
@@ -919,8 +1038,8 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 		return TRIGGER_MODE_WAIT;
 	}
 
-	//The reply is due one record duration after the request; if it is very late, something got lost
-	double limit = 2 * GetRecordSeconds() + WATCHDOG_MARGIN_S;
+	//The reply is due within the trigger wait plus the record; if it is very late, something got lost
+	double limit = 2 * GetRequestSeconds() + WATCHDOG_MARGIN_S;
 	if(GetTime() - m_requestTime > limit)
 	{
 		LogWarning("Oscill: no waveform in %.1f s, re-arming\n", limit);
@@ -931,31 +1050,46 @@ Oscilloscope::TriggerMode OscillOscilloscope::PollTrigger()
 }
 
 /**
-	@brief Looks for the trigger edge in a record and sets m_swTriggerPhase so that the crossing lands at the
-	configured trigger offset. Returns false (and a zero phase) if the record has no matching edge.
+	@brief Sets m_swTriggerPhase so that the trigger crossing lands at the configured trigger offset.
+
+	Records the hardware triggered on (attribute bits 5-4: 01 falling, 10 rising, 11 also seen) have the crossing just
+	before sample TC; it is refined to sub-sample precision by an edge search near there. Untriggered records (Auto
+	timeout, Force) are aligned on the edge nearest the trigger offset if there is one, else left unaligned.
  */
-bool OscillOscilloscope::ApplySoftwareTrigger(const WaveformFrame& wf)
+void OscillOscilloscope::AlignTrigger(const WaveformFrame& wf)
 {
 	//Runs on the instrument thread: use the cached trigger settings only. ngscopeclient can replace (and delete)
 	//the trigger object from the GUI thread at any time without taking our lock.
 	m_swTriggerPhase = 0;
 	if(wf.samples.size() <= JUNK_SAMPLES + 1)
-		return false;
+		return;
 
-	int edges = m_swTrigEdges;
 	int64_t period = GetSamplePeriodFs();
+	const uint8_t* v = &wf.samples[JUNK_SAMPLES];
+	size_t n = wf.samples.size() - JUNK_SAMPLES;
 	double level = g_adcZeroCode + m_swTrigLevel / GetVoltsPerCode();
-	double target = (double)m_triggerOffset / period;
-	//No filtering: narrow (single-sample) pulses are legitimate signals and must be able to trigger
-	double pos = FindEdge(&wf.samples[JUNK_SAMPLES], wf.samples.size() - JUNK_SAMPLES,
-		level, edges, SW_TRIGGER_HYST_CODES, target);
-	LogTrace("Oscill: swtrig level %.1f edges %d target %.1f -> pos %.2f\n", level, edges, target, pos);
-	if(pos < 0)
-		return false;
+	bool hwTriggered = !wf.metadata.empty() && (wf.metadata[0] & 0x30) && (m_rt != RT_FREE_RUN);
+
+	double pos;
+	if(hwTriggered)
+	{
+		double expected = m_tc - HW_TRIGGER_LAG_SAMPLES;
+		pos = FindEdge(v, n, level, m_swTrigEdges, SW_TRIGGER_HYST_CODES, expected);
+		if( (pos < 0) || (fabs(pos - expected) > HW_TRIGGER_SEARCH_SAMPLES) )
+			pos = expected;
+	}
+	else
+	{
+		//No filtering: narrow (single-sample) pulses are legitimate signals and must be able to trigger
+		pos = FindEdge(v, n, level, m_swTrigEdges, SW_TRIGGER_HYST_CODES, (double)m_triggerOffset / period);
+		if(pos < 0)
+			return;
+	}
+	LogTrace("Oscill: trigger attrs %02x, TC %u, level %.1f -> crossing at %.2f\n",
+		wf.metadata.empty() ? 0 : wf.metadata[0], m_tc, level, pos);
 
 	//Sample i is drawn at i * timescale + m_triggerPhase; put the crossing at the trigger offset
 	m_swTriggerPhase = m_triggerOffset - (int64_t)llround(pos * period);
-	return true;
 }
 
 bool OscillOscilloscope::AcquireData()
@@ -1098,7 +1232,7 @@ void OscillOscilloscope::PullTrigger()
 {
 	lock_guard<recursive_mutex> lock(m_mutex);
 
-	//The trigger exists only in software: the trigger object is the source of truth
+	//The probe's trigger registers are derived from the trigger object, which is the source of truth
 	if(m_trigger && !dynamic_cast<EdgeTrigger*>(m_trigger))
 	{
 		delete m_trigger;
@@ -1140,8 +1274,8 @@ void OscillOscilloscope::PushTrigger()
 		LogWarning("Oscill: only edge triggers are supported\n");
 		return;
 	}
-	//The hardware trigger registers have no effect on fw 1.26: the software trigger uses these cached values
 	CacheTriggerSettings();
+	PushTriggerRegisters();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1216,7 +1350,8 @@ void OscillOscilloscope::SetSampleRate(uint64_t rate)
 void OscillOscilloscope::SetTriggerOffset(int64_t offset)
 {
 	lock_guard<recursive_mutex> lock(m_mutex);
-	m_triggerOffset = offset;		//used by the software trigger only
+	m_triggerOffset = offset;
+	PushTriggerPosition();
 }
 
 int64_t OscillOscilloscope::GetTriggerOffset()

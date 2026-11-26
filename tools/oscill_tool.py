@@ -151,13 +151,16 @@ class Link:
         if not r:
             self.abort()
             return None
-        if len(r) < 15 or r[0] != 0xA0:
+        if len(r) < 7 or r[0] != 0xA0:
             print("unexpected:", hexs(r))
             return None
         hl = struct.unpack(">H", r[4:6])[0]
         body = r[3 + hl:]
+        if body == bytes.fromhex("49 00 03"):
+            return "empty"      # Wait mode (RT=1) timed out without a trigger
         if len(body) <= 7:
-            return "empty"      # 49 00 03: Wait mode (RT=1) timed out without a trigger
+            print("unexpected:", hexs(r))
+            return None
         return body[:7], body[7:]
 
 

@@ -112,14 +112,21 @@ protected:
 	void PushTimebase();
 	void ReadTimebaseState();
 
-	//Software trigger
-	bool ApplySoftwareTrigger(const oscill::WaveformFrame& wf);
+	//Trigger
+	void AlignTrigger(const oscill::WaveformFrame& wf);
 	void CacheTriggerSettings();
+	void PushTriggerRegisters();
+	void PushTriggerLevel();
+	void PushTriggerPosition();
+	void SetRunMode(uint8_t rt);
+	uint8_t DesiredRunMode();
+	uint32_t SecondsToTimerUnits(double s);
 
 	//Scaling helpers
 	double GetVoltsPerCode();
 	int64_t GetSamplePeriodFs();
 	double GetRecordSeconds();
+	double GetRequestSeconds();
 	double TSToRate(uint32_t ts);
 	uint32_t RateToTS(uint64_t rate);
 	uint64_t NominalRate(uint32_t ts);
@@ -150,10 +157,13 @@ protected:
 	uint64_t m_sampleRate;		//rate shown to ngscopeclient (nearest list entry to the real one)
 	uint8_t m_o1;				//input option bits (coupling, filters)
 	int64_t m_triggerOffset;	//femtoseconds from record start to the trigger point
-	int64_t m_swTriggerPhase;	//time shift putting the software trigger crossing at m_triggerOffset
+	int64_t m_swTriggerPhase;	//time shift putting the trigger crossing at m_triggerOffset
 	double m_swTrigLevel;		//trigger level in volts, copied from m_trigger under m_mutex
 	int m_swTrigEdges;			//EDGE_RISING_BIT / EDGE_FALLING_BIT, copied from m_trigger under m_mutex
 	uint64_t m_lastDepth;		//samples per delivered waveform (m_qs minus the garbage)
+	uint8_t m_rt;				//run mode last written to the probe (RT_UNKNOWN if not known)
+	uint32_t m_tc;				//pre-trigger count last written
+	uint32_t m_tcMax;			//TCh: longest pre-trigger count at the current rate
 
 	//Diagnostics: if the probe rejects register writes we stop spamming the log
 	unsigned int m_regWriteFailures;

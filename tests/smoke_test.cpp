@@ -97,7 +97,7 @@ int main(int argc, char** argv)
 
 	if(argc < 2)
 	{
-		LogError("usage: %s /dev/ttyUSB0:921600 [count] [trigger|filters|stress|slow]\n", argv[0]);
+		LogError("usage: %s /dev/ttyUSB0:921600 [count] [connect|trigger|filters|stress|slow]\n", argv[0]);
 		return 2;
 	}
 	int count = (argc > 2) ? atoi(argv[2]) : 3;
@@ -130,6 +130,18 @@ int main(int argc, char** argv)
 		scope->GetVendor().c_str(), scope->GetName().c_str(), scope->GetSerial().c_str(), scope->IDPing().c_str());
 
 	bool ok = true;
+
+	if( (argc > 3) && (string(argv[3]) == "connect") )
+	{
+		//Connect only (identity read by the constructor) and exit: for repeated-connect reliability tests
+		bool ok = !scope->GetSerial().empty();
+		LogNotice("%s\n", ok ? "CONNECT TEST PASSED" : "CONNECT TEST FAILED");
+		scope = nullptr;
+		ScopehalStaticCleanup();
+		fflush(stdout);
+		fflush(stderr);
+		_exit(ok ? 0 : 1);
+	}
 
 	if( (argc > 3) && (string(argv[3]) == "slow") )
 	{
@@ -298,7 +310,8 @@ int main(int argc, char** argv)
 	{
 		LogNotice("--- software trigger alignment (hold the probe tip) ---\n");
 		scope->SetChannelVoltageRange(0, 0, 0.8);		//0.1 V/div
-		scope->SetSampleRate(6400);						//~40 ms per record = 2 mains cycles
+		//default ~40 ms per record = 2 mains cycles; argv[4] overrides the rate
+		scope->SetSampleRate( (argc > 4) ? strtoull(argv[4], nullptr, 10) : 6400 );
 		scope->SetTriggerOffset(scope->GetSampleDepth() / 2 * (FS_PER_SECOND / scope->GetSampleRate()));
 		bool ok = CheckTriggerAlignment(scope, EdgeTrigger::EDGE_RISING, "rising");
 		ok &= CheckTriggerAlignment(scope, EdgeTrigger::EDGE_FALLING, "falling");
